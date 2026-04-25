@@ -14,7 +14,6 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
 
 # --- FIXED PROMPT STRATEGY ---
-# Refined for Photo-Realistic SDXL output
 FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text}, 8k UHD, highly detailed, masterfully lit, sharp focus, professional photography, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 
 # Audio recording constants
@@ -22,7 +21,8 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-SILENCE_THRESHOLD = 300 
+SILENCE_THRESHOLD = 400  # Lowered for better sensitivity
+SILENCE_TIMEOUT = 5.0    # Increased to 5 seconds before resetting
 
 class RealTimePipeline:
     def __init__(self):
@@ -33,6 +33,7 @@ class RealTimePipeline:
         self.audio_buffer = []
         self.last_text = ""
         self.is_running = True
+        self.last_speech_time = time.time()
         
         self.lock = threading.Lock()
         
@@ -44,18 +45,27 @@ class RealTimePipeline:
                         input=True,
                         frames_per_buffer=CHUNK)
         
-        print("\n>>> Fixed Prompt Pipeline Active. Visuals will update CONSTANTLY.")
+        print("\n>>> Active. Visuals will update when you speak.")
         
         while self.is_running:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 audio_data = np.frombuffer(data, dtype=np.int16)
+                avg_vol = np.abs(audio_data).mean()
                 
                 with self.lock:
-                    self.audio_buffer.append(audio_data)
-                    # Keep buffer at max 20 seconds for real-time responsiveness
-                    if len(self.audio_buffer) > (20 * RATE / CHUNK):
-                        self.audio_buffer.pop(0)
+                    if avg_vol > SILENCE_THRESHOLD:
+                        self.audio_buffer.append(audio_data)
+                        self.last_speech_time = time.time()
+                        # Keep buffer at max 20 seconds
+                        if len(self.audio_buffer) > (20 * RATE / CHUNK):
+                            self.audio_buffer.pop(0)
+                    else:
+                        # If silent for too long, clear the buffer to stop hallucinations
+                        if time.time() - self.last_speech_time > SILENCE_TIMEOUT:
+                            if self.audio_buffer:
+                                self.audio_buffer = []
+                                self.last_text = ""
             except Exception as e:
                 print(f"Audio Error: {e}")
 
@@ -65,35 +75,31 @@ class RealTimePipeline:
 
     def transcription_loop(self):
         while self.is_running:
-            time.sleep(0.5) # Fast 500ms updates for instant visual changes
+            time.sleep(0.6) 
             
             with self.lock:
-                if not self.audio_buffer:
+                if len(self.audio_buffer) < (RATE / CHUNK): # Need at least 1s of audio
                     continue
                 full_audio = np.concatenate(self.audio_buffer).astype(np.float32) / 32768.0
             
-            # 1. Transcribe the current buffer (fast)
-            # We use a short window to keep the visuals moving
+            # Use no_speech_threshold to help Whisper ignore noise
             result = self.model.transcribe(full_audio, fp16=(DEVICE == "cuda"), language='en')
             text = result["text"].strip()
             
+            # Filter out common Whisper hallucinations
+            hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
+            if any(h.lower() in text.lower() for h in hallucinations):
+                continue
+
             if text and text != self.last_text:
                 self.last_text = text
-                
-                # 2. Apply the FIXED PROMPT TEMPLATE
-                # This bypasses LLM latency for instant updates
                 final_prompt = FIXED_PROMPT_TEMPLATE.format(text=text)
                 
-                # 3. Send to TouchDesigner
                 self.osc_client.send_message("/prompt", final_prompt)
                 self.osc_client.send_message("/partial_text", text)
                 
-                print(f"\r[PROMPT]: {final_prompt[:90]}...", end="")
+                sys.stdout.write(f"\r[PROMPT]: {text[:80]}...         ")
                 sys.stdout.flush()
-
-            # Optional: Clear buffer if a very long silence is detected (e.g. 5 seconds)
-            # This helps "reset" the visual theme when you stop talking.
-            # ... (omitted for pure constant mode)
 
     def start(self):
         t1 = threading.Thread(target=self.audio_callback, daemon=True)

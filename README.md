@@ -4,11 +4,12 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Instant Photorealistic Generation**: Fixed Prompt Template strategy optimized for high-end SDXL photographic output (35mm lens, RAW photo, 8k).
+- **Instant Photorealistic Generation**: Fixed Prompt Template strategy optimized for high-end SDXL photographic output.
 - **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
+- **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
+- **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
 - **Multi-Threaded Architecture**: Concurrent audio capture and transcription for fluid, non-blocking performance.
 - **Real-time Integration**: Ultra-fast 500ms OSC updates to TouchDesigner.
-- **Visual Continuity**: Rolling audio buffer ensures that visuals evolve naturally as you speak.
 
 ## 🛠️ Tech Stack
 
