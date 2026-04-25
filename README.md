@@ -4,7 +4,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Instant Photorealistic Generation**: Fixed Prompt Template strategy optimized for high-end SDXL photographic output.
+- **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Chinese-American experience, blending modern US settings with traditional Chinese motifs.
 - **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.

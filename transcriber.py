@@ -14,7 +14,8 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
 
 # --- FIXED PROMPT STRATEGY ---
-FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text}, 8k UHD, highly detailed, masterfully lit, sharp focus, professional photography, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+# Optimized for the Asian-American experience: blending modern US life with Chinese cultural motifs
+FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text}, capturing the Chinese-American identity, blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 
 # Audio recording constants
 CHUNK = 1024
@@ -57,8 +58,8 @@ class RealTimePipeline:
                     if avg_vol > SILENCE_THRESHOLD:
                         self.audio_buffer.append(audio_data)
                         self.last_speech_time = time.time()
-                        # Keep buffer at max 20 seconds
-                        if len(self.audio_buffer) > (20 * RATE / CHUNK):
+                        # Keep buffer at max 12 seconds for SDXL token safety
+                        if len(self.audio_buffer) > (12 * RATE / CHUNK):
                             self.audio_buffer.pop(0)
                     else:
                         # If silent for too long, clear the buffer to stop hallucinations
