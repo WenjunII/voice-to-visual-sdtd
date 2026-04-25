@@ -4,20 +4,34 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Chinese-American experience, blending modern US settings with traditional Chinese motifs.
-- **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
+- **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Asian-American experience, blending modern US settings with traditional Chinese motifs.
+- **Live Transcription**: High-performance audio-to-text using **OpenAI Whisper** (Medium model).
+- **Multi-Stage Orchestration**: Fallback chain for prompt refinement ensuring high-quality visual descriptors even when primary models are unavailable.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
 - **Multi-Threaded Architecture**: Concurrent audio capture and transcription for fluid, non-blocking performance.
-- **Real-time Integration**: Ultra-fast 500ms OSC updates to TouchDesigner.
+- **Real-time Integration**: Ultra-fast OSC updates to TouchDesigner for instantaneous visual feedback.
 
 ## 🛠️ Tech Stack
 
-- **Transcription**: `faster-whisper`
-- **LLM Orchestration**: Capriole API (Claude/Gemini/GPT) + Local Ollama
+- **Transcription**: `openai-whisper` (Medium Model)
+- **LLM Orchestration**: 
+    1. **Gemini 3 Flash Preview** (Primary)
+    2. **Kimi k2.6** (Fallback 1)
+    3. **Gemma 4 (31b)** (Fallback 2)
 - **Visual Engine**: StreamDiffusion (SDXL-Turbo/Lightning)
-- **Bridge**: TouchDesigner (via OSC)
+- **Bridge**: TouchDesigner (via OSC on Port 7000)
 - **Language**: Python 3.10+
+
+## 🎨 Fixed Prompt Strategy
+
+The system utilizes a specialized template to maintain a consistent "Cultural Fusion" aesthetic:
+
+```text
+A hyper-realistic photorealistic cinematic shot of {text}, capturing the Chinese-American identity, 
+blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 
+8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics...
+```
 
 ## 📦 Installation
 
@@ -33,7 +47,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
     ```
 
 3.  **Environment Setup**:
-    Set your Capriole API key in your environment variables:
+    Set your Capriole API key (if using cloud models) in your environment variables:
     ```powershell
     $env:CAPRIOLE_API_KEY = "your_key_here"
     ```
@@ -45,8 +59,9 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
     ```bash
     python transcriber.py
     ```
-3.  **Speak**: The system will automatically capture your speech, refine it, and update the visuals in real-time.
+3.  **Speak**: The system will automatically capture your speech, refine it via the LLM chain, and update the visuals in real-time.
 
 ## 📜 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
