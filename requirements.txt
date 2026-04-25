@@ -1,11 +1,13 @@
 # Core Requirements
 requests
-faster-whisper
+numpy<1.25.0
+PyAudio
+openai-whisper
 streamdiffusion
 torch
 torchvision
 torchaudio
-python-osc
+pythonosc
 google-generativeai
 cupy-cuda12x
-spout-python
+SpoutGL

@@ -4,14 +4,12 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Live Transcription**: High-performance audio-to-text using `faster-whisper` (Medium model).
+- **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
 - **Intelligent Rephrasing**: Multi-LLM sequence to clean, augment, and structure prompts.
-- **Robust Fallback Chain**: 
-    1. Claude Opus 4.7 Thinking
-    2. Gemini 3.1 Pro
-    3. GPT-5.5
-    4. Local Ollama (Gemini 3 Flash)
-    5. Local Ollama (Kimi K2.6)
+- **Local LLM Sequence**: 
+    1. Gemini 3 Flash (via Ollama)
+    2. Kimi K2.6 Cloud (via Ollama)
+    3. Gemma 4 31B Cloud (via Ollama)
 - **Real-time Integration**: Seamless OSC communication with TouchDesigner.
 - **Visual Continuity**: LLM-driven scene context management to ensure smooth visual transitions.
 

@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import json
-from python_osc import udp_client
+from pythonosc import udp_client
 
 # --- Configuration ---
 OSC_IP = "127.0.0.1"
@@ -13,11 +13,9 @@ OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 
 # The sequence of models to attempt (as a fallback chain)
 MODEL_SEQUENCE = [
-    {"type": "capriole", "model": "anthropic/claude-opus-4-7-thinking"},
-    {"type": "capriole", "model": "google/gemini-3.1-pro-preview"},
-    {"type": "capriole", "model": "openai/gpt-5.5"},
     {"type": "ollama", "model": "gemini-3-flash-preview"},
-    {"type": "ollama", "model": "kimi-k2.6:cloud"}
+    {"type": "ollama", "model": "kimi-k2.6:cloud"},
+    {"type": "ollama", "model": "gemma4:31b-cloud"}
 ]
 
 class MultiLLMClient:
