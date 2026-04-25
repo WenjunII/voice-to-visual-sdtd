@@ -1,0 +1,11 @@
+# Core Requirements
+requests
+faster-whisper
+streamdiffusion
+torch
+torchvision
+torchaudio
+python-osc
+google-generativeai
+cupy-cuda12x
+spout-python
