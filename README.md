@@ -4,7 +4,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Instant Visual Generation**: Fixed Prompt Template strategy for zero-latency response times.
+- **Instant Photorealistic Generation**: Fixed Prompt Template strategy optimized for high-end SDXL photographic output (35mm lens, RAW photo, 8k).
 - **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
 - **Multi-Threaded Architecture**: Concurrent audio capture and transcription for fluid, non-blocking performance.
 - **Real-time Integration**: Ultra-fast 500ms OSC updates to TouchDesigner.

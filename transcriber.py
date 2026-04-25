@@ -14,8 +14,8 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
 
 # --- FIXED PROMPT STRATEGY ---
-# The {text} placeholder will be replaced by your live transcription
-FIXED_PROMPT_TEMPLATE = "A cinematic digital art of {text}, highly detailed, 8k, masterpiece, trending on artstation, vibrant lighting"
+# Refined for Photo-Realistic SDXL output
+FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text}, 8k UHD, highly detailed, masterfully lit, sharp focus, professional photography, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 
 # Audio recording constants
 CHUNK = 1024
