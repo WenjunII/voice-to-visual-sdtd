@@ -4,14 +4,11 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
+- **Instant Visual Generation**: Fixed Prompt Template strategy for zero-latency response times.
 - **Live Transcription**: High-performance audio-to-text using **openai-whisper** (Medium model).
-- **Intelligent Rephrasing**: Multi-LLM sequence to clean, augment, and structure prompts.
-- **Local LLM Sequence**: 
-    1. Gemini 3 Flash (via Ollama)
-    2. Kimi K2.6 Cloud (via Ollama)
-    3. Gemma 4 31B Cloud (via Ollama)
-- **Real-time Integration**: Seamless OSC communication with TouchDesigner.
-- **Visual Continuity**: LLM-driven scene context management to ensure smooth visual transitions.
+- **Multi-Threaded Architecture**: Concurrent audio capture and transcription for fluid, non-blocking performance.
+- **Real-time Integration**: Ultra-fast 500ms OSC updates to TouchDesigner.
+- **Visual Continuity**: Rolling audio buffer ensures that visuals evolve naturally as you speak.
 
 ## 🛠️ Tech Stack
 
