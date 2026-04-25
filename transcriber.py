@@ -6,6 +6,7 @@ import torch
 import threading
 import time
 from pythonosc import udp_client
+import msvcrt
 
 # --- Configuration ---
 MODEL_SIZE = "medium"
@@ -14,8 +15,24 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
 
 # --- FIXED PROMPT STRATEGY ---
-# Optimized for the Asian-American experience: blending modern US life with Chinese cultural motifs
-FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text}, capturing the Chinese-American identity, blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+# GENDER MODES: Press 'm' for Man, 'w' for Woman, 'n' for Neutral (General)
+GENDER_MODES = {
+    "man": "Chinese-American man",
+    "woman": "Chinese-American woman",
+    "neutral": "person"
+}
+
+# AGE MODES: Press '1' for Young, '2' for Adult, '3' for Elder
+AGE_MODES = {
+    "young": "young",
+    "adult": "adult",
+    "elder": "elderly"
+}
+
+CURRENT_GENDER = "neutral"
+CURRENT_AGE = "adult"
+
+FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age_desc} {gender_focus}, capturing a diverse Chinese-American identity, blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 
 # Audio recording constants
 CHUNK = 1024
@@ -35,6 +52,8 @@ class RealTimePipeline:
         self.last_text = ""
         self.is_running = True
         self.last_speech_time = time.time()
+        self.current_gender = CURRENT_GENDER
+        self.current_age = CURRENT_AGE
         
         self.lock = threading.Lock()
         
@@ -85,7 +104,13 @@ class RealTimePipeline:
             
             # Use no_speech_threshold to help Whisper ignore noise
             result = self.model.transcribe(full_audio, fp16=(DEVICE == "cuda"), language='en')
-            text = result["text"].strip()
+            # Reverse segments so the latest speech appears first (Stable Diffusion gives more weight to the beginning of the prompt)
+            segments = result.get("segments", [])
+            if segments:
+                # Combine reversed segments: "Latest sentence. Previous sentence. Oldest sentence."
+                text = " ".join([s["text"].strip() for s in reversed(segments)])
+            else:
+                text = result["text"].strip()
             
             # Filter out common Whisper hallucinations
             hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
@@ -94,7 +119,9 @@ class RealTimePipeline:
 
             if text and text != self.last_text:
                 self.last_text = text
-                final_prompt = FIXED_PROMPT_TEMPLATE.format(text=text)
+                gender_focus = GENDER_MODES.get(self.current_gender, "person")
+                age_desc = AGE_MODES.get(self.current_age, "")
+                final_prompt = FIXED_PROMPT_TEMPLATE.format(age_desc=age_desc, gender_focus=gender_focus, text=text)
                 
                 self.osc_client.send_message("/prompt", final_prompt)
                 self.osc_client.send_message("/partial_text", text)
@@ -110,8 +137,35 @@ class RealTimePipeline:
         t2.start()
         
         try:
+            print("\n" + "="*50)
+            print("CONTROL KEYS:")
+            print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
+            print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
+            print("  Ctrl+C   -> Exit")
+            print("="*50 + "\n")
+            
             while True:
-                time.sleep(1)
+                if msvcrt.kbhit():
+                    key = msvcrt.getch().decode('utf-8').lower()
+                    if key == 'm':
+                        self.current_gender = "man"
+                        print(f"\n[MODE]: GENDER -> MAN")
+                    elif key == 'w':
+                        self.current_gender = "woman"
+                        print(f"\n[MODE]: GENDER -> WOMAN")
+                    elif key == 'n':
+                        self.current_gender = "neutral"
+                        print(f"\n[MODE]: GENDER -> NEUTRAL")
+                    elif key == '1':
+                        self.current_age = "young"
+                        print(f"\n[MODE]: AGE -> YOUNG")
+                    elif key == '2':
+                        self.current_age = "adult"
+                        print(f"\n[MODE]: AGE -> ADULT")
+                    elif key == '3':
+                        self.current_age = "elder"
+                        print(f"\n[MODE]: AGE -> ELDER")
+                time.sleep(0.1)
         except KeyboardInterrupt:
             self.is_running = False
             print("\nShutting down...")

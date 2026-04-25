@@ -5,11 +5,12 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 ## 🚀 Features
 
 - **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Asian-American experience, blending modern US settings with traditional Chinese motifs.
+- **Live Gender & Age Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) in real-time.
+- **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
 - **Live Transcription**: High-performance audio-to-text using **OpenAI Whisper** (Medium model).
 - **Multi-Stage Orchestration**: Fallback chain for prompt refinement ensuring high-quality visual descriptors even when primary models are unavailable.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
-- **Multi-Threaded Architecture**: Concurrent audio capture and transcription for fluid, non-blocking performance.
 - **Real-time Integration**: Ultra-fast OSC updates to TouchDesigner for instantaneous visual feedback.
 
 ## 🛠️ Tech Stack
@@ -25,13 +26,26 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🎨 Fixed Prompt Strategy
 
-The system utilizes a specialized template to maintain a consistent "Cultural Fusion" aesthetic:
+The system utilizes a specialized template to maintain a consistent "Cultural Fusion" aesthetic while dynamically injecting speaker identity:
 
 ```text
-A hyper-realistic photorealistic cinematic shot of {text}, capturing the Chinese-American identity, 
-blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 
-8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics...
+A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age} {gender}, 
+capturing a diverse Chinese-American identity, blending modern US urban settings with 
+subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed...
 ```
+
+## 🎮 Interactive Controls
+
+While `transcriber.py` is running, you can use the following keyboard shortcuts to adjust the visuals live:
+
+| Category | Key | Action |
+| :--- | :--- | :--- |
+| **Gender** | `m` | Set focus to **Man** |
+| | `w` | Set focus to **Woman** |
+| | `n` | Set focus to **Neutral/Person** |
+| **Age** | `1` | Set focus to **Young** |
+| | `2` | Set focus to **Adult** |
+| | `3` | Set focus to **Elderly** |
 
 ## 📦 Installation
 
@@ -52,14 +66,14 @@ blending modern US urban settings with subtle traditional Chinese cultural motif
     $env:CAPRIOLE_API_KEY = "your_key_here"
     ```
 
-## 🎮 Usage
+## 🕹️ Usage
 
 1.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
 2.  **Start the Pipeline**:
     ```bash
     python transcriber.py
     ```
-3.  **Speak**: The system will automatically capture your speech, refine it via the LLM chain, and update the visuals in real-time.
+3.  **Speak & Control**: The system will automatically capture your speech. Use the keys above to shift the identity of the generated figures as you talk.
 
 ## 📜 License
 
