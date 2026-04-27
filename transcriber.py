@@ -54,6 +54,7 @@ class RealTimePipeline:
         self.last_speech_time = time.time()
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
+        self.current_language = None # Default to Auto
         
         self.lock = threading.Lock()
         
@@ -103,7 +104,12 @@ class RealTimePipeline:
                 full_audio = np.concatenate(self.audio_buffer).astype(np.float32) / 32768.0
             
             # Use no_speech_threshold to help Whisper ignore noise
-            result = self.model.transcribe(full_audio, fp16=(DEVICE == "cuda"), language='en')
+            result = self.model.transcribe(
+                full_audio, 
+                fp16=(DEVICE == "cuda"), 
+                task="translate", 
+                language=self.current_language
+            )
             # Reverse segments so the latest speech appears first (Stable Diffusion gives more weight to the beginning of the prompt)
             segments = result.get("segments", [])
             if segments:
@@ -141,6 +147,7 @@ class RealTimePipeline:
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
+            print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
             print("  Ctrl+C   -> Exit")
             print("="*50 + "\n")
             
@@ -165,6 +172,18 @@ class RealTimePipeline:
                     elif key == '3':
                         self.current_age = "elder"
                         print(f"\n[MODE]: AGE -> ELDER")
+                    elif key == 'e':
+                        self.current_language = "en"
+                        print(f"\n[MODE]: LANG -> ENGLISH")
+                    elif key == 'c':
+                        self.current_language = "zh"
+                        print(f"\n[MODE]: LANG -> CHINESE")
+                    elif key == 's':
+                        self.current_language = "es"
+                        print(f"\n[MODE]: LANG -> SPANISH")
+                    elif key == 'a':
+                        self.current_language = None
+                        print(f"\n[MODE]: LANG -> AUTO-DETECT")
                 time.sleep(0.1)
         except KeyboardInterrupt:
             self.is_running = False

@@ -8,7 +8,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Live Gender & Age Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
 - **Live Transcription**: High-performance audio-to-text using **OpenAI Whisper** (Medium model).
-- **Multi-Stage Orchestration**: Fallback chain for prompt refinement ensuring high-quality visual descriptors even when primary models are unavailable.
+- **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
 - **Real-time Integration**: Ultra-fast OSC updates to TouchDesigner for instantaneous visual feedback.
@@ -46,6 +46,10 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | **Age** | `1` | Set focus to **Young** |
 | | `2` | Set focus to **Adult** |
 | | `3` | Set focus to **Elderly** |
+| **Language** | `e` | Force **English** transcription |
+| | `c` | Force **Chinese** (Mandarin/Cantonese) |
+| | `s` | Force **Spanish** transcription |
+| | `a` | **Auto-detect** language (Default) |
 
 ## 📦 Installation
 
