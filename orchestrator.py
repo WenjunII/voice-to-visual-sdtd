@@ -7,9 +7,21 @@ from pythonosc import udp_client
 # --- Configuration ---
 OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
-CAPRIOLE_API_KEY = "sk-ul90SZYJfLC3V8C-PXMaeCwT0X-bCkrDDebiHFh0V4c"
 CAPRIOLE_ENDPOINT = "https://api.caprioletech.com/v1/chat"
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
+
+# Load local environment variables from .env if present
+if os.path.exists(".env"):
+    with open(".env", "r") as f:
+        for line in f:
+            if line.strip() and not line.strip().startswith("#"):
+                try:
+                    key, val = line.strip().split("=", 1)
+                    os.environ[key.strip()] = val.strip().strip('"').strip("'")
+                except ValueError:
+                    pass
+
+CAPRIOLE_API_KEY = os.environ.get("CAPRIOLE_API_KEY", "")
 
 # The sequence of models to attempt (as a fallback chain)
 MODEL_SEQUENCE = [

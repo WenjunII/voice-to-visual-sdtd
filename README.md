@@ -65,10 +65,19 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
 
 3.  **Environment Setup**:
-    Set your Capriole API key (if using cloud models) in your environment variables:
-    ```powershell
-    $env:CAPRIOLE_API_KEY = "your_key_here"
-    ```
+    Set your Capriole API key (if using cloud models). You can do this in two ways:
+
+    *   **Option A: Use a `.env` file (Recommended)**
+        Create a `.env` file in the root directory of the project (which is automatically ignored by Git to keep your key secure):
+        ```env
+        CAPRIOLE_API_KEY="your_key_here"
+        ```
+
+    *   **Option B: Set Environment Variable**
+        Or, set it directly in your terminal environment:
+        ```powershell
+        $env:CAPRIOLE_API_KEY = "your_key_here"
+        ```
 
 ## 🕹️ Usage
 
