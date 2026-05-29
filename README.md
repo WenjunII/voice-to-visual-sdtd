@@ -119,14 +119,20 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 ## 🕹️ Usage
 
 1.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
-2.  **Start the Pipeline**:
+2.  **Start the Pipeline with your `.env` default**:
     ```bash
     python transcriber.py
     ```
-    To run the online multilingual translation backend for lower local GPU usage:
+    To choose a backend for just one run without editing `.env`:
+    ```powershell
+    python transcriber.py --backend groq
+    python transcriber.py --backend whisper
+    ```
+    `groq` uses online multilingual translation and does not load local Whisper. `whisper` uses local OpenAI Whisper on CUDA GPU.
+
+    You can also override the backend for the current PowerShell session:
     ```powershell
     $env:TRANSCRIPTION_BACKEND = "groq"
-    $env:GROQ_API_KEY = "your_groq_key_here"
     python transcriber.py
     ```
 3.  **Speak & Control**: The system will automatically capture your speech. Use the keys above to shift the identity of the generated figures as you talk.

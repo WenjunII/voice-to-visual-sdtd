@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import wave
+import argparse
 import numpy as np
 import pyaudio
 import requests
@@ -36,11 +37,23 @@ def env_float(name, default):
         return default
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Live speech-to-visual prompt bridge for StreamDiffusionTD.")
+    parser.add_argument(
+        "-b",
+        "--backend",
+        choices=["whisper", "groq", "google"],
+        help="Transcription backend. Overrides TRANSCRIPTION_BACKEND from .env for this run."
+    )
+    return parser.parse_args()
+
+
 load_env_file()
+ARGS = parse_args()
 
 # --- Configuration ---
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "medium")
-TRANSCRIPTION_BACKEND = os.environ.get("TRANSCRIPTION_BACKEND", "whisper").strip().lower()
+TRANSCRIPTION_BACKEND = (ARGS.backend or os.environ.get("TRANSCRIPTION_BACKEND", "whisper")).strip().lower()
 if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "google"}:
     print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")
     TRANSCRIPTION_BACKEND = "whisper"
