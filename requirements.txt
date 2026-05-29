@@ -3,6 +3,7 @@ requests
 numpy<1.25.0
 PyAudio
 openai-whisper
+SpeechRecognition
 streamdiffusion
 torch
 torchvision

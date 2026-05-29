@@ -7,7 +7,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Asian-American experience, blending modern US settings with traditional Chinese motifs.
 - **Live Gender & Age Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
-- **Live Transcription**: High-performance audio-to-text using **OpenAI Whisper** (Medium model).
+- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model) or online **Groq Whisper** translation for lower local GPU usage.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
@@ -15,7 +15,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🛠️ Tech Stack
 
-- **Transcription**: `openai-whisper` (Medium Model)
+- **Transcription**: `openai-whisper` (Medium Model, CUDA GPU default), Groq `whisper-large-v3` translation (online optional), or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
 - **LLM Orchestration**: 
     1. **Gemini 3 Flash Preview** (Primary)
     2. **Kimi k2.6** (Fallback 1)
@@ -65,6 +65,14 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
 
 3.  **Environment Setup**:
+    Copy the example environment file and keep real credentials in your local `.env` only:
+
+    ```powershell
+    Copy-Item .env.example .env
+    ```
+
+    The project ignores `.env` and `.env.*` files so API keys are not synced to GitHub. Keep `.env.example` placeholder-only.
+
     Set your Capriole API key (if using cloud models). You can do this in two ways:
 
     *   **Option A: Use a `.env` file (Recommended)**
@@ -79,6 +87,35 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
         $env:CAPRIOLE_API_KEY = "your_key_here"
         ```
 
+    Optional live transcription settings:
+
+    ```env
+    # Default: local Whisper, best multilingual translation, requires a CUDA GPU.
+    TRANSCRIPTION_BACKEND=whisper
+    WHISPER_MODEL_SIZE=medium
+    WHISPER_DEVICE=cuda
+
+    # Recommended online option for StreamDiffusion: multilingual audio -> English prompt text.
+    # Uses Groq's hosted Whisper translation endpoint. The free plan has rate limits.
+    # Requires internet, a free Groq API key, and sends microphone audio to Groq.
+    # TRANSCRIPTION_BACKEND=groq
+    # GROQ_API_KEY="your_groq_key_here"
+    # GROQ_TRANSCRIPTION_MODEL=whisper-large-v3
+    # GROQ_TRANSCRIPTION_INTERVAL=5.0
+    # GROQ_MIN_AUDIO_SECONDS=2.0
+    # GROQ_MAX_AUDIO_SECONDS=5.0
+
+    # Current Groq free-plan limits for whisper-large-v3:
+    # 20 requests/minute, 2,000 requests/day,
+    # 7,200 audio seconds/hour, 28,800 audio seconds/day.
+
+    # Recognition-only online experiment. This does not translate to English.
+    # TRANSCRIPTION_BACKEND=google
+    # GOOGLE_SPEECH_LANGUAGE=en-US
+    # GOOGLE_SPEECH_CHINESE_LANGUAGE=zh-CN
+    # GOOGLE_SPEECH_SPANISH_LANGUAGE=es-ES
+    ```
+
 ## 🕹️ Usage
 
 1.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
@@ -86,9 +123,14 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```bash
     python transcriber.py
     ```
+    To run the online multilingual translation backend for lower local GPU usage:
+    ```powershell
+    $env:TRANSCRIPTION_BACKEND = "groq"
+    $env:GROQ_API_KEY = "your_groq_key_here"
+    python transcriber.py
+    ```
 3.  **Speak & Control**: The system will automatically capture your speech. Use the keys above to shift the identity of the generated figures as you talk.
 
 ## 📜 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-

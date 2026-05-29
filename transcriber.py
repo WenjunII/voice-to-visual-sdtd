@@ -1,18 +1,91 @@
+import os
 import sys
+import io
+import wave
 import numpy as np
 import pyaudio
-import whisper
-import torch
+import requests
 import threading
 import time
 from pythonosc import udp_client
 import msvcrt
 
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+load_env_file()
+
 # --- Configuration ---
-MODEL_SIZE = "medium"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "medium")
+TRANSCRIPTION_BACKEND = os.environ.get("TRANSCRIPTION_BACKEND", "whisper").strip().lower()
+if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "google"}:
+    print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")
+    TRANSCRIPTION_BACKEND = "whisper"
+
+torch = None
+TORCH_IMPORT_ERROR = None
+if TRANSCRIPTION_BACKEND == "whisper":
+    try:
+        import torch as torch_module
+        torch = torch_module
+    except Exception as exc:
+        TORCH_IMPORT_ERROR = exc
+
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cuda").strip().lower()
+if WHISPER_DEVICE:
+    DEVICE = WHISPER_DEVICE
+else:
+    DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
+
 OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
+
+# Online transcription is useful when TouchDesigner/StreamDiffusion needs the GPU.
+# Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
+GROQ_TRANSLATIONS_ENDPOINT = os.environ.get(
+    "GROQ_TRANSLATIONS_ENDPOINT",
+    "https://api.groq.com/openai/v1/audio/translations"
+)
+GROQ_TRANSCRIPTION_INTERVAL = env_float("GROQ_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 5.0))
+GROQ_MIN_AUDIO_SECONDS = env_float("GROQ_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 2.0))
+GROQ_MAX_AUDIO_SECONDS = env_float("GROQ_MAX_AUDIO_SECONDS", 5.0)
+GROQ_REQUEST_TIMEOUT = env_float("GROQ_REQUEST_TIMEOUT", 20.0)
+
+# This free Google path is recognition-only and does not translate to English.
+GOOGLE_TRANSCRIPTION_INTERVAL = env_float("GOOGLE_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 2.0))
+GOOGLE_MIN_AUDIO_SECONDS = env_float("GOOGLE_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 1.5))
+GOOGLE_MAX_AUDIO_SECONDS = env_float("GOOGLE_MAX_AUDIO_SECONDS", 5.0)
+GOOGLE_SPEECH_LANGUAGE = os.environ.get("GOOGLE_SPEECH_LANGUAGE", "en-US")
+GOOGLE_LANGUAGE_MAP = {
+    "en": os.environ.get("GOOGLE_SPEECH_ENGLISH_LANGUAGE", "en-US"),
+    "zh": os.environ.get("GOOGLE_SPEECH_CHINESE_LANGUAGE", "zh-CN"),
+    "es": os.environ.get("GOOGLE_SPEECH_SPANISH_LANGUAGE", "es-ES"),
+}
 
 # --- FIXED PROMPT STRATEGY ---
 # GENDER MODES: Press 'm' for Man, 'w' for Woman, 'n' for Neutral (General)
@@ -44,8 +117,48 @@ SILENCE_TIMEOUT = 5.0    # Increased to 5 seconds before resetting
 
 class RealTimePipeline:
     def __init__(self):
-        print(f"Loading Whisper model '{MODEL_SIZE}' on {DEVICE}...")
-        self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+        self.backend = TRANSCRIPTION_BACKEND
+        self.model = None
+        self.online_recognizer = None
+        self.last_online_request_time = 0
+
+        if self.backend == "whisper":
+            if torch is None:
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=whisper requires torch. Run: pip install -r requirements.txt"
+                ) from TORCH_IMPORT_ERROR
+            if not DEVICE.startswith("cuda") or not torch.cuda.is_available():
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=whisper is configured to require a CUDA GPU. "
+                    "Use TRANSCRIPTION_BACKEND=groq for online translation without local GPU usage."
+                )
+            try:
+                import whisper
+            except ImportError as exc:
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=whisper requires openai-whisper. "
+                    "Run: pip install -r requirements.txt"
+                ) from exc
+
+            print(f"Loading Whisper model '{MODEL_SIZE}' on {DEVICE}...")
+            self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+        elif self.backend == "groq":
+            if not GROQ_API_KEY:
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=groq requires GROQ_API_KEY in your environment or .env file."
+                )
+            print(f"Using Groq online Whisper translation backend ({GROQ_MODEL}). No local Whisper model loaded.")
+            print("Note: this sends microphone audio to Groq and returns English text for StreamDiffusion prompts.")
+        else:
+            if sr is None:
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=google requires the SpeechRecognition package. "
+                    "Run: pip install SpeechRecognition"
+                )
+            print("Using online Google Speech Recognition backend. No local Whisper model loaded.")
+            print("Note: this sends microphone audio to Google's speech service and does not translate to English.")
+            self.online_recognizer = sr.Recognizer()
+
         self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
         
         self.audio_buffer = []
@@ -99,26 +212,21 @@ class RealTimePipeline:
             time.sleep(0.6) 
             
             with self.lock:
-                if len(self.audio_buffer) < (RATE / CHUNK): # Need at least 1s of audio
+                min_audio_seconds = self.minimum_audio_seconds()
+                if len(self.audio_buffer) < (min_audio_seconds * RATE / CHUNK):
                     continue
-                full_audio = np.concatenate(self.audio_buffer).astype(np.float32) / 32768.0
+                full_audio = np.concatenate(self.audio_buffer).copy()
+
+            if self.backend in {"groq", "google"}:
+                now = time.time()
+                if now - self.last_online_request_time < self.online_request_interval():
+                    continue
+                self.last_online_request_time = now
+                full_audio = self.limit_online_audio_window(full_audio)
             
-            # Use no_speech_threshold to help Whisper ignore noise
-            result = self.model.transcribe(
-                full_audio, 
-                fp16=(DEVICE == "cuda"), 
-                task="translate", 
-                language=self.current_language
-            )
-            # Reverse segments so the latest speech appears first (Stable Diffusion gives more weight to the beginning of the prompt)
-            segments = result.get("segments", [])
-            if segments:
-                # Combine reversed segments: "Latest sentence. Previous sentence. Oldest sentence."
-                text = " ".join([s["text"].strip() for s in reversed(segments)])
-            else:
-                text = result["text"].strip()
+            text = self.transcribe_audio(full_audio)
             
-            # Filter out common Whisper hallucinations
+            # Filter out common recognizer hallucinations
             hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
             if any(h.lower() in text.lower() for h in hallucinations):
                 continue
@@ -135,6 +243,103 @@ class RealTimePipeline:
                 sys.stdout.write(f"\r[PROMPT]: {text[:80]}...         ")
                 sys.stdout.flush()
 
+    def transcribe_audio(self, audio_samples):
+        if self.backend == "groq":
+            return self.transcribe_groq(audio_samples)
+        if self.backend == "google":
+            return self.transcribe_google(audio_samples)
+        return self.transcribe_whisper(audio_samples)
+
+    def minimum_audio_seconds(self):
+        if self.backend == "groq":
+            return GROQ_MIN_AUDIO_SECONDS
+        if self.backend == "google":
+            return GOOGLE_MIN_AUDIO_SECONDS
+        return 1.0
+
+    def online_request_interval(self):
+        if self.backend == "groq":
+            return GROQ_TRANSCRIPTION_INTERVAL
+        return GOOGLE_TRANSCRIPTION_INTERVAL
+
+    def limit_online_audio_window(self, audio_samples):
+        max_seconds = GROQ_MAX_AUDIO_SECONDS if self.backend == "groq" else GOOGLE_MAX_AUDIO_SECONDS
+        max_samples = int(max_seconds * RATE)
+        if max_samples <= 0 or len(audio_samples) <= max_samples:
+            return audio_samples
+        return audio_samples[-max_samples:]
+
+    def transcribe_whisper(self, audio_samples):
+        full_audio = audio_samples.astype(np.float32) / 32768.0
+        result = self.model.transcribe(
+            full_audio,
+            fp16=DEVICE.startswith("cuda"),
+            task="translate",
+            language=self.current_language
+        )
+
+        # Reverse segments so the latest speech has more weight at the start of the SDXL prompt.
+        segments = result.get("segments", [])
+        if segments:
+            return " ".join([s["text"].strip() for s in reversed(segments)])
+        return result["text"].strip()
+
+    def transcribe_groq(self, audio_samples):
+        wav_bytes = self.encode_wav(audio_samples)
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
+        data = {
+            "model": GROQ_MODEL,
+            "response_format": "json",
+            "temperature": "0",
+        }
+
+        try:
+            response = requests.post(
+                GROQ_TRANSLATIONS_ENDPOINT,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=GROQ_REQUEST_TIMEOUT
+            )
+            if response.status_code == 429:
+                print("\n[GROQ TRANSCRIPTION RATE LIMIT]: Slow down or wait for the free quota to reset.")
+                return ""
+            if response.status_code >= 400:
+                print(f"\n[GROQ TRANSCRIPTION ERROR]: HTTP {response.status_code} {response.text[:160]}")
+                return ""
+            return response.json().get("text", "").strip()
+        except requests.RequestException as e:
+            print(f"\n[GROQ TRANSCRIPTION ERROR]: {e}")
+            return ""
+
+    def encode_wav(self, audio_samples):
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(CHANNELS)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(RATE)
+            wav_file.writeframes(audio_samples.astype(np.int16).tobytes())
+        buffer.seek(0)
+        return buffer.read()
+
+    def transcribe_google(self, audio_samples):
+        audio_data = sr.AudioData(audio_samples.astype(np.int16).tobytes(), RATE, 2)
+        language = self.google_language()
+
+        try:
+            return self.online_recognizer.recognize_google(audio_data, language=language).strip()
+        except sr.UnknownValueError:
+            return ""
+        except sr.RequestError as e:
+            print(f"\n[ONLINE TRANSCRIPTION ERROR]: {e}")
+            return ""
+
+    def google_language(self):
+        if self.current_language:
+            return GOOGLE_LANGUAGE_MAP.get(self.current_language, self.current_language)
+        return GOOGLE_SPEECH_LANGUAGE
+
     def start(self):
         t1 = threading.Thread(target=self.audio_callback, daemon=True)
         t2 = threading.Thread(target=self.transcription_loop, daemon=True)
@@ -148,6 +353,10 @@ class RealTimePipeline:
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
             print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
+            if self.backend == "groq":
+                print("  [ONLINE] Groq translates detected speech to English automatically")
+            if self.backend == "google":
+                print(f"  [ONLINE] Auto/default language -> {GOOGLE_SPEECH_LANGUAGE}")
             print("  Ctrl+C   -> Exit")
             print("="*50 + "\n")
             
