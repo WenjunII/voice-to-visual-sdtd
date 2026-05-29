@@ -94,16 +94,31 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     TRANSCRIPTION_BACKEND=whisper
     WHISPER_MODEL_SIZE=medium
     WHISPER_DEVICE=cuda
+    # Local Whisper speed/latency tuning. Use small/base for faster but lower-quality output.
+    WHISPER_TRANSCRIPTION_INTERVAL=0.8
+    WHISPER_MIN_AUDIO_SECONDS=0.8
+    WHISPER_MAX_AUDIO_SECONDS=6.0
+    WHISPER_BEAM_SIZE=1
+    WHISPER_BEST_OF=1
+    WHISPER_TEMPERATURE=0.0
+    WHISPER_CONDITION_ON_PREVIOUS_TEXT=false
+    WHISPER_LOG_LATENCY=true
 
     # Recommended online option for StreamDiffusion: multilingual audio -> English prompt text.
     # Uses Groq's hosted Whisper translation endpoint. The free plan has rate limits.
     # Requires internet, a free Groq API key, and sends microphone audio to Groq.
     # TRANSCRIPTION_BACKEND=groq
     # GROQ_API_KEY="your_groq_key_here"
+    # Faster Groq settings for lower latency. 3.2s stays below the 20 RPM free limit.
+    # Groq translation requires whisper-large-v3; turbo is transcription-only.
     # GROQ_TRANSCRIPTION_MODEL=whisper-large-v3
-    # GROQ_TRANSCRIPTION_INTERVAL=5.0
-    # GROQ_MIN_AUDIO_SECONDS=2.0
-    # GROQ_MAX_AUDIO_SECONDS=5.0
+    # GROQ_TEXT_TRANSLATION_MODEL=llama-3.1-8b-instant
+    # GROQ_RESPONSE_FORMAT=text
+    # GROQ_ENGLISH_FALLBACK=auto
+    # GROQ_TRANSCRIPTION_INTERVAL=3.2
+    # GROQ_MIN_AUDIO_SECONDS=1.0
+    # GROQ_MAX_AUDIO_SECONDS=6.0
+    # GROQ_LOG_LATENCY=true
 
     # Current Groq free-plan limits for whisper-large-v3:
     # 20 requests/minute, 2,000 requests/day,
@@ -128,7 +143,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     python transcriber.py --backend groq
     python transcriber.py --backend whisper
     ```
-    `groq` uses online multilingual translation and does not load local Whisper. `whisper` uses local OpenAI Whisper on CUDA GPU.
+    `groq` uses online multilingual translation and does not load local Whisper. `whisper` uses local OpenAI Whisper on CUDA GPU. If Groq audio translation returns Chinese/Cantonese text, `GROQ_ENGLISH_FALLBACK=auto` sends that text through a fast Groq chat model for an English prompt. For the lowest latency, local Whisper is usually better because it avoids network round trips. You can make local Whisper faster by lowering `WHISPER_MODEL_SIZE` to `small` or `base`, reducing `WHISPER_MAX_AUDIO_SECONDS`, or increasing `WHISPER_TRANSCRIPTION_INTERVAL`.
 
     You can also override the backend for the current PowerShell session:
     ```powershell

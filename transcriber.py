@@ -37,6 +37,13 @@ def env_float(name, default):
         return default
 
 
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Live speech-to-visual prompt bridge for StreamDiffusionTD.")
     parser.add_argument(
@@ -73,6 +80,15 @@ if WHISPER_DEVICE:
 else:
     DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
 
+WHISPER_TRANSCRIPTION_INTERVAL = env_float("WHISPER_TRANSCRIPTION_INTERVAL", 0.8)
+WHISPER_MIN_AUDIO_SECONDS = env_float("WHISPER_MIN_AUDIO_SECONDS", 0.8)
+WHISPER_MAX_AUDIO_SECONDS = env_float("WHISPER_MAX_AUDIO_SECONDS", 6.0)
+WHISPER_BEAM_SIZE = int(env_float("WHISPER_BEAM_SIZE", 1))
+WHISPER_BEST_OF = int(env_float("WHISPER_BEST_OF", 1))
+WHISPER_TEMPERATURE = env_float("WHISPER_TEMPERATURE", 0.0)
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = env_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
+WHISPER_LOG_LATENCY = env_bool("WHISPER_LOG_LATENCY", True)
+
 OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
 
@@ -80,14 +96,26 @@ OSC_PORT = 7000
 # Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
+GROQ_TEXT_TRANSLATION_MODEL = os.environ.get("GROQ_TEXT_TRANSLATION_MODEL", "llama-3.1-8b-instant")
 GROQ_TRANSLATIONS_ENDPOINT = os.environ.get(
     "GROQ_TRANSLATIONS_ENDPOINT",
     "https://api.groq.com/openai/v1/audio/translations"
 )
-GROQ_TRANSCRIPTION_INTERVAL = env_float("GROQ_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 5.0))
-GROQ_MIN_AUDIO_SECONDS = env_float("GROQ_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 2.0))
-GROQ_MAX_AUDIO_SECONDS = env_float("GROQ_MAX_AUDIO_SECONDS", 5.0)
+GROQ_CHAT_ENDPOINT = os.environ.get(
+    "GROQ_CHAT_ENDPOINT",
+    "https://api.groq.com/openai/v1/chat/completions"
+)
+GROQ_TRANSLATION_PROMPT = os.environ.get(
+    "GROQ_TRANSLATION_PROMPT",
+    "Translate all speech to natural concise English for a visual generation prompt."
+)
+GROQ_RESPONSE_FORMAT = os.environ.get("GROQ_RESPONSE_FORMAT", "text")
+GROQ_TRANSCRIPTION_INTERVAL = env_float("GROQ_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 3.2))
+GROQ_MIN_AUDIO_SECONDS = env_float("GROQ_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 1.0))
+GROQ_MAX_AUDIO_SECONDS = env_float("GROQ_MAX_AUDIO_SECONDS", 6.0)
 GROQ_REQUEST_TIMEOUT = env_float("GROQ_REQUEST_TIMEOUT", 20.0)
+GROQ_LOG_LATENCY = env_bool("GROQ_LOG_LATENCY", True)
+GROQ_ENGLISH_FALLBACK = os.environ.get("GROQ_ENGLISH_FALLBACK", "auto").strip().lower()
 
 # This free Google path is recognition-only and does not translate to English.
 GOOGLE_TRANSCRIPTION_INTERVAL = env_float("GOOGLE_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 2.0))
@@ -134,6 +162,8 @@ class RealTimePipeline:
         self.model = None
         self.online_recognizer = None
         self.last_online_request_time = 0
+        self.last_whisper_request_time = 0
+        self.http = requests.Session() if self.backend == "groq" else None
 
         if self.backend == "whisper":
             if torch is None:
@@ -175,6 +205,8 @@ class RealTimePipeline:
         self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
         
         self.audio_buffer = []
+        self.audio_version = 0
+        self.last_submitted_audio_version = 0
         self.last_text = ""
         self.is_running = True
         self.last_speech_time = time.time()
@@ -203,6 +235,7 @@ class RealTimePipeline:
                 with self.lock:
                     if avg_vol > SILENCE_THRESHOLD:
                         self.audio_buffer.append(audio_data)
+                        self.audio_version += 1
                         self.last_speech_time = time.time()
                         # Keep buffer at max 12 seconds for SDXL token safety
                         if len(self.audio_buffer) > (12 * RATE / CHUNK):
@@ -228,6 +261,9 @@ class RealTimePipeline:
                 min_audio_seconds = self.minimum_audio_seconds()
                 if len(self.audio_buffer) < (min_audio_seconds * RATE / CHUNK):
                     continue
+                audio_version = self.audio_version
+                if audio_version == self.last_submitted_audio_version:
+                    continue
                 full_audio = np.concatenate(self.audio_buffer).copy()
 
             if self.backend in {"groq", "google"}:
@@ -236,6 +272,14 @@ class RealTimePipeline:
                     continue
                 self.last_online_request_time = now
                 full_audio = self.limit_online_audio_window(full_audio)
+            elif self.backend == "whisper":
+                now = time.time()
+                if now - self.last_whisper_request_time < WHISPER_TRANSCRIPTION_INTERVAL:
+                    continue
+                self.last_whisper_request_time = now
+                full_audio = self.limit_whisper_audio_window(full_audio)
+
+            self.last_submitted_audio_version = audio_version
             
             text = self.transcribe_audio(full_audio)
             
@@ -268,7 +312,7 @@ class RealTimePipeline:
             return GROQ_MIN_AUDIO_SECONDS
         if self.backend == "google":
             return GOOGLE_MIN_AUDIO_SECONDS
-        return 1.0
+        return WHISPER_MIN_AUDIO_SECONDS
 
     def online_request_interval(self):
         if self.backend == "groq":
@@ -282,14 +326,28 @@ class RealTimePipeline:
             return audio_samples
         return audio_samples[-max_samples:]
 
+    def limit_whisper_audio_window(self, audio_samples):
+        max_samples = int(WHISPER_MAX_AUDIO_SECONDS * RATE)
+        if max_samples <= 0 or len(audio_samples) <= max_samples:
+            return audio_samples
+        return audio_samples[-max_samples:]
+
     def transcribe_whisper(self, audio_samples):
         full_audio = audio_samples.astype(np.float32) / 32768.0
+        started = time.perf_counter()
         result = self.model.transcribe(
             full_audio,
             fp16=DEVICE.startswith("cuda"),
             task="translate",
-            language=self.current_language
+            language=self.current_language,
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEST_OF,
+            temperature=WHISPER_TEMPERATURE,
+            condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
         )
+        elapsed = time.perf_counter() - started
+        if WHISPER_LOG_LATENCY:
+            print(f"\n[WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
 
         # Reverse segments so the latest speech has more weight at the start of the SDXL prompt.
         segments = result.get("segments", [])
@@ -303,27 +361,100 @@ class RealTimePipeline:
         files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
         data = {
             "model": GROQ_MODEL,
-            "response_format": "json",
+            "response_format": GROQ_RESPONSE_FORMAT,
             "temperature": "0",
         }
+        if GROQ_TRANSLATION_PROMPT:
+            data["prompt"] = GROQ_TRANSLATION_PROMPT
 
         try:
-            response = requests.post(
+            started = time.perf_counter()
+            response = self.http.post(
                 GROQ_TRANSLATIONS_ENDPOINT,
                 headers=headers,
                 files=files,
                 data=data,
                 timeout=GROQ_REQUEST_TIMEOUT
             )
+            elapsed = time.perf_counter() - started
+            if GROQ_LOG_LATENCY:
+                print(f"\n[GROQ LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
             if response.status_code == 429:
                 print("\n[GROQ TRANSCRIPTION RATE LIMIT]: Slow down or wait for the free quota to reset.")
                 return ""
             if response.status_code >= 400:
+                if response.status_code == 400 and "does not support `translate`" in response.text:
+                    print(
+                        "\n[GROQ TRANSCRIPTION ERROR]: Groq audio translation requires "
+                        "GROQ_TRANSCRIPTION_MODEL=whisper-large-v3."
+                    )
+                    return ""
                 print(f"\n[GROQ TRANSCRIPTION ERROR]: HTTP {response.status_code} {response.text[:160]}")
                 return ""
-            return response.json().get("text", "").strip()
+            if GROQ_RESPONSE_FORMAT == "text":
+                text = response.text.strip()
+            else:
+                text = response.json().get("text", "").strip()
+            return self.ensure_english_prompt_text(text)
         except requests.RequestException as e:
             print(f"\n[GROQ TRANSCRIPTION ERROR]: {e}")
+            return ""
+
+    def ensure_english_prompt_text(self, text):
+        if not text:
+            return ""
+        if GROQ_ENGLISH_FALLBACK == "off":
+            return text
+        if GROQ_ENGLISH_FALLBACK == "always" or self.contains_cjk(text):
+            translated = self.translate_text_to_english(text)
+            return translated or text
+        return text
+
+    def contains_cjk(self, text):
+        return any(
+            "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff"
+            for char in text
+        )
+
+    def translate_text_to_english(self, text):
+        payload = {
+            "model": GROQ_TEXT_TRANSLATION_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a translation engine. Translate the user's text completely into natural concise "
+                        "English for a visual generation prompt. Output only English text. Do not include any "
+                        "Chinese characters."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0,
+            "max_tokens": 120,
+        }
+
+        try:
+            started = time.perf_counter()
+            response = self.http.post(
+                GROQ_CHAT_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=GROQ_REQUEST_TIMEOUT,
+            )
+            elapsed = time.perf_counter() - started
+            if response.status_code >= 400:
+                print(f"\n[GROQ TEXT TRANSLATION ERROR]: HTTP {response.status_code} {response.text[:160]}")
+                return ""
+            translation = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if GROQ_LOG_LATENCY:
+                print(f"\n[GROQ TEXT TRANSLATION]: {elapsed:.2f}s")
+            return translation
+        except requests.RequestException as e:
+            print(f"\n[GROQ TEXT TRANSLATION ERROR]: {e}")
             return ""
 
     def encode_wav(self, audio_samples):
