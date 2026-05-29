@@ -4,6 +4,8 @@ numpy<1.25.0
 PyAudio
 openai-whisper
 SpeechRecognition
+argostranslate
+langdetect
 streamdiffusion
 torch
 torchvision

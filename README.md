@@ -7,7 +7,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Asian-American experience, blending modern US settings with traditional Chinese motifs.
 - **Live Gender & Age Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
-- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model) or online **Groq Whisper** translation for lower local GPU usage.
+- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
@@ -15,7 +15,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🛠️ Tech Stack
 
-- **Transcription**: `openai-whisper` (Medium Model, CUDA GPU default), Groq `whisper-large-v3` translation (online optional), or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
+- **Transcription**: `openai-whisper` (Medium Model, CUDA GPU default), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
 - **LLM Orchestration**: 
     1. **Gemini 3 Flash Preview** (Primary)
     2. **Kimi k2.6** (Fallback 1)
@@ -120,6 +120,21 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     # GROQ_MAX_AUDIO_SECONDS=6.0
     # GROQ_LOG_LATENCY=true
 
+    # Experimental hybrid mode:
+    # Groq turbo transcribes online, then Argos Translate translates non-English text locally on CPU.
+    # This may be faster than Groq audio translation, but quality depends on the local translator.
+    # Whisper cannot do this local text translation step; Whisper only translates audio.
+    # If Argos is not installed or cannot load, hybrid mode still transcribes but passes non-English text through.
+    # TRANSCRIPTION_BACKEND=groq_hybrid
+    # GROQ_HYBRID_MODEL=whisper-large-v3-turbo
+    # LOCAL_TRANSLATOR=argos
+    # LOCAL_TRANSLATOR_TARGET_LANGUAGE=en
+    # LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE=zh
+    # LOCAL_TRANSLATOR_PRELOAD_LANGUAGES=zh,es
+    # LOCAL_TRANSLATOR_AUTO_INSTALL=true
+    # LOCAL_TRANSLATOR_LOG_LATENCY=true
+    # HYBRID_TRANSLATION_FALLBACK=groq_text
+
     # Current Groq free-plan limits for whisper-large-v3:
     # 20 requests/minute, 2,000 requests/day,
     # 7,200 audio seconds/hour, 28,800 audio seconds/day.
@@ -141,9 +156,10 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     To choose a backend for just one run without editing `.env`:
     ```powershell
     python transcriber.py --backend groq
+    python transcriber.py --backend groq_hybrid
     python transcriber.py --backend whisper
     ```
-    `groq` uses online multilingual translation and does not load local Whisper. `whisper` uses local OpenAI Whisper on CUDA GPU. If Groq audio translation returns Chinese/Cantonese text, `GROQ_ENGLISH_FALLBACK=auto` sends that text through a fast Groq chat model for an English prompt. For the lowest latency, local Whisper is usually better because it avoids network round trips. You can make local Whisper faster by lowering `WHISPER_MODEL_SIZE` to `small` or `base`, reducing `WHISPER_MAX_AUDIO_SECONDS`, or increasing `WHISPER_TRANSCRIPTION_INTERVAL`.
+    `groq` uses online multilingual translation and does not load local Whisper. `groq_hybrid` uses Groq turbo for online transcription, then translates non-English text locally on CPU with Argos Translate when available. If local translation is unavailable or still returns Chinese/Cantonese text, `HYBRID_TRANSLATION_FALLBACK=groq_text` sends only the transcript text through a fast Groq chat model for English cleanup. `whisper` uses local OpenAI Whisper on CUDA GPU. If Groq audio translation returns Chinese/Cantonese text, `GROQ_ENGLISH_FALLBACK=auto` sends that text through a fast Groq chat model for an English prompt. For the lowest latency, local Whisper is usually better because it avoids network round trips. You can make local Whisper faster by lowering `WHISPER_MODEL_SIZE` to `small` or `base`, reducing `WHISPER_MAX_AUDIO_SECONDS`, or increasing `WHISPER_TRANSCRIPTION_INTERVAL`.
 
     You can also override the backend for the current PowerShell session:
     ```powershell

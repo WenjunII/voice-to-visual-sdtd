@@ -16,6 +16,13 @@ try:
 except ImportError:
     sr = None
 
+try:
+    from langdetect import detect as detect_language
+    from langdetect.lang_detect_exception import LangDetectException
+except ImportError:
+    detect_language = None
+    LangDetectException = Exception
+
 
 def load_env_file(path=".env"):
     if not os.path.exists(path):
@@ -49,7 +56,7 @@ def parse_args():
     parser.add_argument(
         "-b",
         "--backend",
-        choices=["whisper", "groq", "google"],
+        choices=["whisper", "groq", "groq_hybrid", "google"],
         help="Transcription backend. Overrides TRANSCRIPTION_BACKEND from .env for this run."
     )
     return parser.parse_args()
@@ -61,7 +68,7 @@ ARGS = parse_args()
 # --- Configuration ---
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "medium")
 TRANSCRIPTION_BACKEND = (ARGS.backend or os.environ.get("TRANSCRIPTION_BACKEND", "whisper")).strip().lower()
-if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "google"}:
+if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "groq_hybrid", "google"}:
     print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")
     TRANSCRIPTION_BACKEND = "whisper"
 
@@ -96,7 +103,12 @@ OSC_PORT = 7000
 # Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
+GROQ_HYBRID_MODEL = os.environ.get("GROQ_HYBRID_MODEL", "whisper-large-v3-turbo")
 GROQ_TEXT_TRANSLATION_MODEL = os.environ.get("GROQ_TEXT_TRANSLATION_MODEL", "llama-3.1-8b-instant")
+GROQ_TRANSCRIPTIONS_ENDPOINT = os.environ.get(
+    "GROQ_TRANSCRIPTIONS_ENDPOINT",
+    "https://api.groq.com/openai/v1/audio/transcriptions"
+)
 GROQ_TRANSLATIONS_ENDPOINT = os.environ.get(
     "GROQ_TRANSLATIONS_ENDPOINT",
     "https://api.groq.com/openai/v1/audio/translations"
@@ -116,6 +128,18 @@ GROQ_MAX_AUDIO_SECONDS = env_float("GROQ_MAX_AUDIO_SECONDS", 6.0)
 GROQ_REQUEST_TIMEOUT = env_float("GROQ_REQUEST_TIMEOUT", 20.0)
 GROQ_LOG_LATENCY = env_bool("GROQ_LOG_LATENCY", True)
 GROQ_ENGLISH_FALLBACK = os.environ.get("GROQ_ENGLISH_FALLBACK", "auto").strip().lower()
+
+LOCAL_TRANSLATOR = os.environ.get("LOCAL_TRANSLATOR", "argos").strip().lower()
+LOCAL_TRANSLATOR_TARGET_LANGUAGE = os.environ.get("LOCAL_TRANSLATOR_TARGET_LANGUAGE", "en").strip().lower()
+LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE = os.environ.get("LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE", "zh").strip().lower()
+LOCAL_TRANSLATOR_AUTO_INSTALL = env_bool("LOCAL_TRANSLATOR_AUTO_INSTALL", True)
+LOCAL_TRANSLATOR_PRELOAD_LANGUAGES = [
+    lang.strip().lower()
+    for lang in os.environ.get("LOCAL_TRANSLATOR_PRELOAD_LANGUAGES", "zh,es").split(",")
+    if lang.strip()
+]
+LOCAL_TRANSLATOR_LOG_LATENCY = env_bool("LOCAL_TRANSLATOR_LOG_LATENCY", True)
+HYBRID_TRANSLATION_FALLBACK = os.environ.get("HYBRID_TRANSLATION_FALLBACK", "groq_text").strip().lower()
 
 # This free Google path is recognition-only and does not translate to English.
 GOOGLE_TRANSCRIPTION_INTERVAL = env_float("GOOGLE_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 2.0))
@@ -163,7 +187,10 @@ class RealTimePipeline:
         self.online_recognizer = None
         self.last_online_request_time = 0
         self.last_whisper_request_time = 0
-        self.http = requests.Session() if self.backend == "groq" else None
+        self.http = requests.Session() if self.backend in {"groq", "groq_hybrid"} else None
+        self.argos_package = None
+        self.argos_translate = None
+        self.local_translation_cache = {}
 
         if self.backend == "whisper":
             if torch is None:
@@ -185,13 +212,18 @@ class RealTimePipeline:
 
             print(f"Loading Whisper model '{MODEL_SIZE}' on {DEVICE}...")
             self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
-        elif self.backend == "groq":
+        elif self.backend in {"groq", "groq_hybrid"}:
             if not GROQ_API_KEY:
                 raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=groq requires GROQ_API_KEY in your environment or .env file."
+                    f"TRANSCRIPTION_BACKEND={self.backend} requires GROQ_API_KEY in your environment or .env file."
                 )
-            print(f"Using Groq online Whisper translation backend ({GROQ_MODEL}). No local Whisper model loaded.")
-            print("Note: this sends microphone audio to Groq and returns English text for StreamDiffusion prompts.")
+            if self.backend == "groq":
+                print(f"Using Groq online Whisper translation backend ({GROQ_MODEL}). No local Whisper model loaded.")
+                print("Note: this sends microphone audio to Groq and returns English text for StreamDiffusion prompts.")
+            else:
+                print(f"Using Groq hybrid backend ({GROQ_HYBRID_MODEL}) with local CPU text translation.")
+                print("Note: Groq transcribes audio online; non-English text is translated locally when possible.")
+                self.initialize_local_translator()
         else:
             if sr is None:
                 raise RuntimeError(
@@ -266,7 +298,7 @@ class RealTimePipeline:
                     continue
                 full_audio = np.concatenate(self.audio_buffer).copy()
 
-            if self.backend in {"groq", "google"}:
+            if self.backend in {"groq", "groq_hybrid", "google"}:
                 now = time.time()
                 if now - self.last_online_request_time < self.online_request_interval():
                     continue
@@ -303,24 +335,26 @@ class RealTimePipeline:
     def transcribe_audio(self, audio_samples):
         if self.backend == "groq":
             return self.transcribe_groq(audio_samples)
+        if self.backend == "groq_hybrid":
+            return self.transcribe_groq_hybrid(audio_samples)
         if self.backend == "google":
             return self.transcribe_google(audio_samples)
         return self.transcribe_whisper(audio_samples)
 
     def minimum_audio_seconds(self):
-        if self.backend == "groq":
+        if self.backend in {"groq", "groq_hybrid"}:
             return GROQ_MIN_AUDIO_SECONDS
         if self.backend == "google":
             return GOOGLE_MIN_AUDIO_SECONDS
         return WHISPER_MIN_AUDIO_SECONDS
 
     def online_request_interval(self):
-        if self.backend == "groq":
+        if self.backend in {"groq", "groq_hybrid"}:
             return GROQ_TRANSCRIPTION_INTERVAL
         return GOOGLE_TRANSCRIPTION_INTERVAL
 
     def limit_online_audio_window(self, audio_samples):
-        max_seconds = GROQ_MAX_AUDIO_SECONDS if self.backend == "groq" else GOOGLE_MAX_AUDIO_SECONDS
+        max_seconds = GROQ_MAX_AUDIO_SECONDS if self.backend in {"groq", "groq_hybrid"} else GOOGLE_MAX_AUDIO_SECONDS
         max_samples = int(max_seconds * RATE)
         if max_samples <= 0 or len(audio_samples) <= max_samples:
             return audio_samples
@@ -400,6 +434,45 @@ class RealTimePipeline:
             print(f"\n[GROQ TRANSCRIPTION ERROR]: {e}")
             return ""
 
+    def transcribe_groq_hybrid(self, audio_samples):
+        wav_bytes = self.encode_wav(audio_samples)
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
+        data = {
+            "model": GROQ_HYBRID_MODEL,
+            "response_format": GROQ_RESPONSE_FORMAT,
+            "temperature": "0",
+        }
+        if self.current_language:
+            data["language"] = self.current_language
+
+        try:
+            started = time.perf_counter()
+            response = self.http.post(
+                GROQ_TRANSCRIPTIONS_ENDPOINT,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=GROQ_REQUEST_TIMEOUT
+            )
+            elapsed = time.perf_counter() - started
+            if GROQ_LOG_LATENCY:
+                print(f"\n[GROQ HYBRID LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
+            if response.status_code == 429:
+                print("\n[GROQ HYBRID RATE LIMIT]: Slow down or wait for the free quota to reset.")
+                return ""
+            if response.status_code >= 400:
+                print(f"\n[GROQ HYBRID ERROR]: HTTP {response.status_code} {response.text[:160]}")
+                return ""
+            if GROQ_RESPONSE_FORMAT == "text":
+                text = response.text.strip()
+            else:
+                text = response.json().get("text", "").strip()
+            return self.ensure_local_english_prompt_text(text)
+        except requests.RequestException as e:
+            print(f"\n[GROQ HYBRID ERROR]: {e}")
+            return ""
+
     def ensure_english_prompt_text(self, text):
         if not text:
             return ""
@@ -456,6 +529,140 @@ class RealTimePipeline:
         except requests.RequestException as e:
             print(f"\n[GROQ TEXT TRANSLATION ERROR]: {e}")
             return ""
+
+    def initialize_local_translator(self):
+        if LOCAL_TRANSLATOR != "argos":
+            print(f"[LOCAL TRANSLATOR]: Unknown translator '{LOCAL_TRANSLATOR}'. Non-English text will pass through.")
+            return
+        try:
+            import argostranslate.package as argos_package
+            import argostranslate.translate as argos_translate
+        except ImportError:
+            print("[LOCAL TRANSLATOR]: Argos Translate is not installed. Run: pip install argostranslate langdetect")
+            return
+        except Exception as e:
+            print(f"[LOCAL TRANSLATOR]: Argos Translate could not load: {e}")
+            print("[LOCAL TRANSLATOR]: Non-English hybrid transcripts will pass through untranslated.")
+            return
+
+        self.argos_package = argos_package
+        self.argos_translate = argos_translate
+        for source_code in LOCAL_TRANSLATOR_PRELOAD_LANGUAGES:
+            self.get_argos_translation(source_code)
+
+    def ensure_local_english_prompt_text(self, text):
+        if not text:
+            return ""
+        source_language = self.detect_text_language(text)
+        if not source_language or source_language == LOCAL_TRANSLATOR_TARGET_LANGUAGE:
+            return text
+        translated = self.translate_text_locally(text, source_language)
+        if translated and not self.contains_cjk(translated):
+            return translated
+        if HYBRID_TRANSLATION_FALLBACK == "groq_text":
+            fallback = self.translate_text_to_english(text)
+            if fallback:
+                return fallback
+        return translated or text
+
+    def detect_text_language(self, text):
+        if self.current_language:
+            return self.normalize_language_code(self.current_language)
+        if self.contains_cjk(text):
+            return "zh"
+        if detect_language is not None and len(text.strip()) >= 8:
+            try:
+                return self.normalize_language_code(detect_language(text))
+            except LangDetectException:
+                pass
+        if self.looks_like_english(text):
+            return "en"
+        return LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE
+
+    def normalize_language_code(self, language_code):
+        code = (language_code or "").lower()
+        if code.startswith("zh"):
+            return "zh"
+        if code.startswith("es"):
+            return "es"
+        if code.startswith("en"):
+            return "en"
+        return code
+
+    def looks_like_english(self, text):
+        letters = [char for char in text if char.isalpha()]
+        if not letters:
+            return True
+        ascii_letters = [char for char in letters if "a" <= char.lower() <= "z"]
+        return len(ascii_letters) / len(letters) > 0.85
+
+    def translate_text_locally(self, text, source_language):
+        if LOCAL_TRANSLATOR != "argos":
+            return ""
+        translation = self.get_argos_translation(source_language)
+        if translation is None:
+            return ""
+        try:
+            started = time.perf_counter()
+            translated = translation.translate(text).strip()
+            elapsed = time.perf_counter() - started
+            if LOCAL_TRANSLATOR_LOG_LATENCY:
+                print(f"\n[LOCAL TRANSLATION]: {source_language}->en {elapsed:.2f}s")
+            return translated
+        except Exception as e:
+            print(f"\n[LOCAL TRANSLATION ERROR]: {e}")
+            return ""
+
+    def get_argos_translation(self, source_language):
+        source_language = self.normalize_language_code(source_language)
+        cache_key = (source_language, LOCAL_TRANSLATOR_TARGET_LANGUAGE)
+        if cache_key in self.local_translation_cache:
+            return self.local_translation_cache[cache_key]
+        if self.argos_translate is None:
+            return None
+
+        translation = self.find_argos_translation(source_language)
+        if translation is None and LOCAL_TRANSLATOR_AUTO_INSTALL:
+            self.install_argos_package(source_language)
+            translation = self.find_argos_translation(source_language)
+
+        if translation is None:
+            print(f"\n[LOCAL TRANSLATION]: No Argos package for {source_language}->en. Text will pass through.")
+        self.local_translation_cache[cache_key] = translation
+        return translation
+
+    def find_argos_translation(self, source_language):
+        installed_languages = self.argos_translate.get_installed_languages()
+        from_language = next((lang for lang in installed_languages if lang.code == source_language), None)
+        to_language = next((lang for lang in installed_languages if lang.code == LOCAL_TRANSLATOR_TARGET_LANGUAGE), None)
+        if not from_language or not to_language:
+            return None
+        try:
+            return from_language.get_translation(to_language)
+        except Exception:
+            return None
+
+    def install_argos_package(self, source_language):
+        if self.argos_package is None:
+            return
+        try:
+            print(f"\n[LOCAL TRANSLATION]: Installing Argos package {source_language}->en...")
+            self.argos_package.update_package_index()
+            available_packages = self.argos_package.get_available_packages()
+            package = next(
+                (
+                    pkg for pkg in available_packages
+                    if pkg.from_code == source_language and pkg.to_code == LOCAL_TRANSLATOR_TARGET_LANGUAGE
+                ),
+                None
+            )
+            if package is None:
+                print(f"\n[LOCAL TRANSLATION]: No downloadable Argos package for {source_language}->en.")
+                return
+            download_path = package.download()
+            self.argos_package.install_from_path(download_path)
+        except Exception as e:
+            print(f"\n[LOCAL TRANSLATION ERROR]: Could not install {source_language}->en package: {e}")
 
     def encode_wav(self, audio_samples):
         buffer = io.BytesIO()
