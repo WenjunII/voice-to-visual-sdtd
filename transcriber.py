@@ -155,8 +155,8 @@ GOOGLE_LANGUAGE_MAP = {
 # --- FIXED PROMPT STRATEGY ---
 # GENDER MODES: Press 'm' for Man, 'w' for Woman, 'n' for Neutral (General)
 GENDER_MODES = {
-    "man": "Chinese-American man",
-    "woman": "Chinese-American woman",
+    "man": "man",
+    "woman": "woman",
     "neutral": "person"
 }
 
@@ -169,8 +169,27 @@ AGE_MODES = {
 
 CURRENT_GENDER = "neutral"
 CURRENT_AGE = "adult"
+CURRENT_VISUAL_MODE = "asian_american"
 
-FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age_desc} {gender_focus}, capturing a diverse Chinese-American identity, blending modern US urban settings with subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed, masterfully lit, fusion of East and West aesthetics, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+VISUAL_MODES = {
+    "asian_american": {
+        "label": "ASIAN AMERICAN",
+        "subject_prefix": "Asian-American",
+        "context": "capturing a diverse Asian-American identity, blending modern US urban settings with subtle traditional Asian cultural motifs and textures",
+    },
+    "black_brown": {
+        "label": "BLACK AND BROWN PEOPLE",
+        "subject_prefix": "Black or Brown",
+        "context": "centering Black and Brown people, contemporary US urban life, rich diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
+    },
+    "asian_black_brown": {
+        "label": "ASIAN + BLACK AND BROWN PEOPLE",
+        "subject_prefix": "Asian, Black, or Brown",
+        "context": "centering Asian, Black, and Brown people together, diverse contemporary US community life, layered diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
+    },
+}
+
+FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age_desc} {subject_focus}, {visual_context}, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 
 # Audio recording constants
 CHUNK = 1024
@@ -244,6 +263,7 @@ class RealTimePipeline:
         self.last_speech_time = time.time()
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
+        self.current_visual_mode = CURRENT_VISUAL_MODE
         self.current_language = None # Default to Auto
         
         self.lock = threading.Lock()
@@ -322,15 +342,26 @@ class RealTimePipeline:
 
             if text and text != self.last_text:
                 self.last_text = text
-                gender_focus = GENDER_MODES.get(self.current_gender, "person")
-                age_desc = AGE_MODES.get(self.current_age, "")
-                final_prompt = FIXED_PROMPT_TEMPLATE.format(age_desc=age_desc, gender_focus=gender_focus, text=text)
+                final_prompt = self.build_visual_prompt(text)
                 
                 self.osc_client.send_message("/prompt", final_prompt)
                 self.osc_client.send_message("/partial_text", text)
                 
                 sys.stdout.write(f"\r[PROMPT]: {text[:80]}...         ")
                 sys.stdout.flush()
+
+    def build_visual_prompt(self, text):
+        visual_mode = VISUAL_MODES.get(self.current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
+        gender_focus = GENDER_MODES.get(self.current_gender, "person")
+        age_desc = AGE_MODES.get(self.current_age, "")
+        subject_focus = f"{visual_mode['subject_prefix']} {gender_focus}"
+
+        return FIXED_PROMPT_TEMPLATE.format(
+            age_desc=age_desc,
+            subject_focus=subject_focus,
+            visual_context=visual_mode["context"],
+            text=text,
+        )
 
     def transcribe_audio(self, audio_samples):
         if self.backend == "groq":
@@ -703,6 +734,7 @@ class RealTimePipeline:
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
+            print("  [VISUAL] 'd' -> Asian American | 'b' -> Black and Brown people | 'x' -> Asian + Black and Brown")
             print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
             if self.backend == "groq":
                 print("  [ONLINE] Groq translates detected speech to English automatically")
@@ -732,6 +764,15 @@ class RealTimePipeline:
                     elif key == '3':
                         self.current_age = "elder"
                         print(f"\n[MODE]: AGE -> ELDER")
+                    elif key == 'd':
+                        self.current_visual_mode = "asian_american"
+                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
+                    elif key == 'b':
+                        self.current_visual_mode = "black_brown"
+                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
+                    elif key == 'x':
+                        self.current_visual_mode = "asian_black_brown"
+                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
                     elif key == 'e':
                         self.current_language = "en"
                         print(f"\n[MODE]: LANG -> ENGLISH")

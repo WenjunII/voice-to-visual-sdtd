@@ -4,8 +4,8 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Cultural Fusion Generation**: Fixed Prompt Template optimized for the Asian-American experience, blending modern US settings with traditional Chinese motifs.
-- **Live Gender & Age Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) in real-time.
+- **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals or Black and Brown people visuals.
+- **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) and visual representation mode in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
 - **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
@@ -26,12 +26,11 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🎨 Fixed Prompt Strategy
 
-The system utilizes a specialized template to maintain a consistent "Cultural Fusion" aesthetic while dynamically injecting speaker identity:
+The system utilizes a specialized template to maintain a consistent visual aesthetic while dynamically injecting speaker identity and visual representation mode:
 
 ```text
 A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age} {gender}, 
-capturing a diverse Chinese-American identity, blending modern US urban settings with 
-subtle traditional Chinese cultural motifs and textures, 8k UHD, highly detailed...
+{visual identity context}, 8k UHD, highly detailed...
 ```
 
 ## 🎮 Interactive Controls
@@ -46,6 +45,9 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | **Age** | `1` | Set focus to **Young** |
 | | `2` | Set focus to **Adult** |
 | | `3` | Set focus to **Elderly** |
+| **Visual Mode** | `d` | Use default **Asian-American** visuals |
+| | `b` | Use **Black and Brown people** visuals |
+| | `x` | Use **Asian + Black and Brown people** visuals |
 | **Language** | `e` | Force **English** transcription |
 | | `c` | Force **Chinese** (Mandarin/Cantonese) |
 | | `s` | Force **Spanish** transcription |
