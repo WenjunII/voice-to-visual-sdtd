@@ -4,8 +4,9 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🚀 Features
 
-- **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals or Black and Brown people visuals.
-- **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder) and visual representation mode in real-time.
+- **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals, Black and Brown people visuals, or combined Asian + Black and Brown visuals.
+- **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
+- **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
 - **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
@@ -26,11 +27,20 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🎨 Fixed Prompt Strategy
 
-The system utilizes a specialized template to maintain a consistent visual aesthetic while dynamically injecting speaker identity and visual representation mode:
+The system keeps the original human-focused template and adds a second scene-focused template for moments when you want the visuals to describe a place, mood, or environment instead of centering a person.
+
+Human figure focus:
 
 ```text
 A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age} {gender}, 
 {visual identity context}, 8k UHD, highly detailed...
+```
+
+General scene:
+
+```text
+A hyper-realistic photorealistic cinematic scene of {text}, {scene identity context},
+environment-focused composition, no central human figure, no portrait framing, 8k UHD, highly detailed...
 ```
 
 ## 🎮 Interactive Controls
@@ -48,6 +58,8 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | **Visual Mode** | `d` | Use default **Asian-American** visuals |
 | | `b` | Use **Black and Brown people** visuals |
 | | `x` | Use **Asian + Black and Brown people** visuals |
+| **Prompt Style** | `f` | Use original **Human Figure** focus |
+| | `g` | Use **General Scene** focus with no central human figure |
 | **Language** | `e` | Force **English** transcription |
 | | `c` | Force **Chinese** (Mandarin/Cantonese) |
 | | `s` | Force **Spanish** transcription |

@@ -170,26 +170,42 @@ AGE_MODES = {
 CURRENT_GENDER = "neutral"
 CURRENT_AGE = "adult"
 CURRENT_VISUAL_MODE = "asian_american"
+CURRENT_PROMPT_STYLE = "human_focus"
 
 VISUAL_MODES = {
     "asian_american": {
         "label": "ASIAN AMERICAN",
         "subject_prefix": "Asian-American",
         "context": "capturing a diverse Asian-American identity, blending modern US urban settings with subtle traditional Asian cultural motifs and textures",
+        "scene_context": "modern Asian-American neighborhoods and interiors, subtle traditional Asian cultural motifs, layered urban textures, natural cinematic atmosphere",
     },
     "black_brown": {
         "label": "BLACK AND BROWN PEOPLE",
         "subject_prefix": "Black or Brown",
         "context": "centering Black and Brown people, contemporary US urban life, rich diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
+        "scene_context": "contemporary US neighborhoods shaped by Black and Brown diasporic culture, warm natural color palettes, rich textures, vibrant lived-in atmosphere",
     },
     "asian_black_brown": {
         "label": "ASIAN + BLACK AND BROWN PEOPLE",
         "subject_prefix": "Asian, Black, or Brown",
         "context": "centering Asian, Black, and Brown people together, diverse contemporary US community life, layered diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
+        "scene_context": "diverse contemporary US community spaces shaped by Asian, Black, and Brown diasporic culture, layered cultural textures, vibrant lived-in atmosphere",
     },
 }
 
 FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age_desc} {subject_focus}, {visual_context}, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+SCENE_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic scene of {text}, {visual_context}, environment-focused composition, no central human figure, no portrait framing, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+
+PROMPT_STYLES = {
+    "human_focus": {
+        "label": "HUMAN FIGURE",
+        "template": FIXED_PROMPT_TEMPLATE,
+    },
+    "general_scene": {
+        "label": "GENERAL SCENE",
+        "template": SCENE_PROMPT_TEMPLATE,
+    },
+}
 
 # Audio recording constants
 CHUNK = 1024
@@ -264,6 +280,7 @@ class RealTimePipeline:
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
         self.current_visual_mode = CURRENT_VISUAL_MODE
+        self.current_prompt_style = CURRENT_PROMPT_STYLE
         self.current_language = None # Default to Auto
         
         self.lock = threading.Lock()
@@ -352,11 +369,19 @@ class RealTimePipeline:
 
     def build_visual_prompt(self, text):
         visual_mode = VISUAL_MODES.get(self.current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
+        prompt_style = PROMPT_STYLES.get(self.current_prompt_style, PROMPT_STYLES[CURRENT_PROMPT_STYLE])
+
+        if self.current_prompt_style == "general_scene":
+            return prompt_style["template"].format(
+                text=text,
+                visual_context=visual_mode["scene_context"],
+            )
+
         gender_focus = GENDER_MODES.get(self.current_gender, "person")
         age_desc = AGE_MODES.get(self.current_age, "")
         subject_focus = f"{visual_mode['subject_prefix']} {gender_focus}"
 
-        return FIXED_PROMPT_TEMPLATE.format(
+        return prompt_style["template"].format(
             age_desc=age_desc,
             subject_focus=subject_focus,
             visual_context=visual_mode["context"],
@@ -735,6 +760,7 @@ class RealTimePipeline:
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
             print("  [VISUAL] 'd' -> Asian American | 'b' -> Black and Brown people | 'x' -> Asian + Black and Brown")
+            print("  [PROMPT] 'f' -> Human figure focus | 'g' -> General scene")
             print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
             if self.backend == "groq":
                 print("  [ONLINE] Groq translates detected speech to English automatically")
@@ -773,6 +799,12 @@ class RealTimePipeline:
                     elif key == 'x':
                         self.current_visual_mode = "asian_black_brown"
                         print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
+                    elif key == 'f':
+                        self.current_prompt_style = "human_focus"
+                        print(f"\n[MODE]: PROMPT -> {PROMPT_STYLES[self.current_prompt_style]['label']}")
+                    elif key == 'g':
+                        self.current_prompt_style = "general_scene"
+                        print(f"\n[MODE]: PROMPT -> {PROMPT_STYLES[self.current_prompt_style]['label']}")
                     elif key == 'e':
                         self.current_language = "en"
                         print(f"\n[MODE]: LANG -> ENGLISH")
