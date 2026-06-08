@@ -66,7 +66,7 @@ load_env_file()
 ARGS = parse_args()
 
 # --- Configuration ---
-MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "medium")
+MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 TRANSCRIPTION_BACKEND = (ARGS.backend or os.environ.get("TRANSCRIPTION_BACKEND", "whisper")).strip().lower()
 if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "groq_hybrid", "google"}:
     print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")

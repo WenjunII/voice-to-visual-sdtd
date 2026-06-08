@@ -8,7 +8,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
 - **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode in real-time.
 - **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
-- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Medium model), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
+- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Small model by default for faster response), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
 - **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
@@ -16,7 +16,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 ## 🛠️ Tech Stack
 
-- **Transcription**: `openai-whisper` (Medium Model, CUDA GPU default), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
+- **Transcription**: `openai-whisper` (Small Model, CUDA GPU default), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
 - **LLM Orchestration**: 
     1. **Gemini 3 Flash Preview** (Primary)
     2. **Kimi k2.6** (Fallback 1)
@@ -106,7 +106,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```env
     # Default: local Whisper, best multilingual translation, requires a CUDA GPU.
     TRANSCRIPTION_BACKEND=whisper
-    WHISPER_MODEL_SIZE=medium
+    WHISPER_MODEL_SIZE=small
     WHISPER_DEVICE=cuda
     # Local Whisper speed/latency tuning. Use small/base for faster but lower-quality output.
     WHISPER_TRANSCRIPTION_INTERVAL=0.8
