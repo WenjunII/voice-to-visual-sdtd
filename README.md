@@ -69,7 +69,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/WenjunII/voice-to-visual-sdtd.git
+    git clone https://github.com/wenjunii/voice-to-visual-sdtd.git
     cd voice-to-visual-sdtd
     ```
 
