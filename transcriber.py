@@ -1,5 +1,4 @@
 import os
-import sys
 import io
 import wave
 import argparse
@@ -8,8 +7,15 @@ import pyaudio
 import requests
 import threading
 import time
+import queue
 from pythonosc import udp_client
 import msvcrt
+
+from prompt_engine import PromptBudgeter, RollingSceneMemory
+from streaming_core import AudioSegmenter, TranscriptStabilizer
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 try:
     import speech_recognition as sr
@@ -51,13 +57,31 @@ def env_bool(name, default):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Live speech-to-visual prompt bridge for StreamDiffusionTD.")
     parser.add_argument(
         "-b",
         "--backend",
-        choices=["whisper", "groq", "groq_hybrid", "google"],
+        choices=["whisper", "faster_whisper", "groq", "groq_hybrid", "google"],
         help="Transcription backend. Overrides TRANSCRIPTION_BACKEND from .env for this run."
+    )
+    parser.add_argument(
+        "--benchmark",
+        metavar="WAV_PATH",
+        help="Benchmark a local backend with a PCM WAV file instead of opening the microphone."
+    )
+    parser.add_argument(
+        "--benchmark-runs",
+        type=int,
+        default=3,
+        help="Number of measured benchmark runs after warm-up (default: 3)."
     )
     return parser.parse_args()
 
@@ -68,13 +92,13 @@ ARGS = parse_args()
 # --- Configuration ---
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 TRANSCRIPTION_BACKEND = (ARGS.backend or os.environ.get("TRANSCRIPTION_BACKEND", "whisper")).strip().lower()
-if TRANSCRIPTION_BACKEND not in {"whisper", "groq", "groq_hybrid", "google"}:
+if TRANSCRIPTION_BACKEND not in {"whisper", "faster_whisper", "groq", "groq_hybrid", "google"}:
     print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")
     TRANSCRIPTION_BACKEND = "whisper"
 
 torch = None
 TORCH_IMPORT_ERROR = None
-if TRANSCRIPTION_BACKEND == "whisper":
+if TRANSCRIPTION_BACKEND in {"whisper", "faster_whisper"}:
     try:
         import torch as torch_module
         torch = torch_module
@@ -95,6 +119,24 @@ WHISPER_BEST_OF = int(env_float("WHISPER_BEST_OF", 1))
 WHISPER_TEMPERATURE = env_float("WHISPER_TEMPERATURE", 0.0)
 WHISPER_CONDITION_ON_PREVIOUS_TEXT = env_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
 WHISPER_LOG_LATENCY = env_bool("WHISPER_LOG_LATENCY", True)
+FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8_float16").strip()
+FASTER_WHISPER_CPU_THREADS = env_int("FASTER_WHISPER_CPU_THREADS", 4)
+FASTER_WHISPER_NUM_WORKERS = env_int("FASTER_WHISPER_NUM_WORKERS", 1)
+
+SCENE_MEMORY_MAX_WORDS = max(1, env_int("SCENE_MEMORY_MAX_WORDS", 36))
+SCENE_MEMORY_MAX_AGE_SECONDS = env_float("SCENE_MEMORY_MAX_AGE_SECONDS", 20.0)
+PROMPT_TOKEN_BUDGET_ENABLED = env_bool("PROMPT_TOKEN_BUDGET_ENABLED", True)
+PROMPT_MAX_TOKENS = max(1, env_int("PROMPT_MAX_TOKENS", 77))
+PROMPT_MIN_TRANSCRIPT_TOKENS = max(0, env_int("PROMPT_MIN_TRANSCRIPT_TOKENS", 20))
+PROMPT_LOG_TOKENS = env_bool("PROMPT_LOG_TOKENS", True)
+PROMPT_TOKENIZER_MODELS = [
+    model.strip()
+    for model in os.environ.get(
+        "PROMPT_TOKENIZER_MODELS",
+        "openai/clip-vit-large-patch14,laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+    ).split(",")
+    if model.strip()
+]
 
 OSC_IP = "127.0.0.1"
 OSC_PORT = 7000
@@ -178,23 +220,31 @@ VISUAL_MODES = {
         "subject_prefix": "Asian-American",
         "context": "capturing a diverse Asian-American identity, blending modern US urban settings with subtle traditional Asian cultural motifs and textures",
         "scene_context": "modern Asian-American neighborhoods and interiors, subtle traditional Asian cultural motifs, layered urban textures, natural cinematic atmosphere",
+        "compact_context": "Asian-American US setting with subtle Asian cultural motifs",
+        "compact_scene_context": "Asian-American US setting with subtle Asian cultural motifs and cinematic atmosphere",
     },
     "black_brown": {
         "label": "BLACK AND BROWN PEOPLE",
         "subject_prefix": "Black or Brown",
         "context": "centering Black and Brown people, contemporary US urban life, rich diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
         "scene_context": "contemporary US neighborhoods shaped by Black and Brown diasporic culture, warm natural color palettes, rich textures, vibrant lived-in atmosphere",
+        "compact_context": "Black and Brown diasporic US setting with warm tones and rich textures",
+        "compact_scene_context": "Black and Brown diasporic US setting with warm colors and rich textures",
     },
     "asian_black_brown": {
         "label": "ASIAN + BLACK AND BROWN PEOPLE",
         "subject_prefix": "Asian, Black, or Brown",
         "context": "centering Asian, Black, and Brown people together, diverse contemporary US community life, layered diasporic cultural textures, warm natural skin tones, dignified and vibrant representation",
         "scene_context": "diverse contemporary US community spaces shaped by Asian, Black, and Brown diasporic culture, layered cultural textures, vibrant lived-in atmosphere",
+        "compact_context": "diverse Asian, Black, and Brown diasporic US community",
+        "compact_scene_context": "diverse Asian, Black, and Brown diasporic US community spaces",
     },
 }
 
 FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {text} featuring a prominent {age_desc} {subject_focus}, {visual_context}, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 SCENE_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic scene of {text}, {visual_context}, environment-focused composition, no central human figure, no portrait framing, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
+COMPACT_FIXED_PROMPT_TEMPLATE = "Photorealistic cinematic scene: {text}, prominent {age_desc} {subject_focus}, {visual_context}, highly detailed, natural colors, masterfully lit, RAW 35mm photo, f/1.8, 8k"
+COMPACT_SCENE_PROMPT_TEMPLATE = "Photorealistic cinematic scene: {text}, {visual_context}, environment-focused, no central human figure, highly detailed, natural colors, masterfully lit, RAW 35mm photo, f/1.8, 8k"
 
 PROMPT_STYLES = {
     "human_focus": {
@@ -212,11 +262,54 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-SILENCE_THRESHOLD = 400  # Lowered for better sensitivity
-SILENCE_TIMEOUT = 5.0    # Increased to 5 seconds before resetting
+VAD_ENGINE = os.environ.get("VAD_ENGINE", "silero").strip().lower()
+VAD_THRESHOLD = env_float("VAD_THRESHOLD", 0.5)
+VAD_ENERGY_THRESHOLD = env_float("VAD_ENERGY_THRESHOLD", 400.0)
+VAD_PRE_ROLL_SECONDS = env_float("VAD_PRE_ROLL_SECONDS", 0.32)
+VAD_SILENCE_SECONDS = env_float("VAD_SILENCE_SECONDS", 0.7)
+STREAM_OVERLAP_SECONDS = env_float("STREAM_OVERLAP_SECONDS", 0.5)
+TRANSCRIPT_CONFIRM_UPDATES = max(1, env_int("TRANSCRIPT_CONFIRM_UPDATES", 2))
+
+
+class EnergyVoiceActivityDetector:
+    def __init__(self, threshold):
+        self.threshold = threshold
+
+    def is_speech(self, audio_samples):
+        return float(np.abs(audio_samples.astype(np.float32)).mean()) > self.threshold
+
+
+class SileroVoiceActivityDetector:
+    FRAME_SAMPLES = 512
+
+    def __init__(self, threshold):
+        try:
+            import torch as vad_torch
+            from silero_vad import load_silero_vad
+        except ImportError as exc:
+            raise RuntimeError("Silero VAD is not installed") from exc
+
+        self.torch = vad_torch
+        self.threshold = threshold
+        self.model = load_silero_vad(onnx=False)
+        self.model.to("cpu")
+        self.model.eval()
+
+    def is_speech(self, audio_samples):
+        normalized = audio_samples.astype(np.float32) / 32768.0
+        probabilities = []
+        with self.torch.inference_mode():
+            for start in range(0, len(normalized), self.FRAME_SAMPLES):
+                frame = normalized[start:start + self.FRAME_SAMPLES]
+                if len(frame) < self.FRAME_SAMPLES:
+                    frame = np.pad(frame, (0, self.FRAME_SAMPLES - len(frame)))
+                tensor = self.torch.from_numpy(frame).to("cpu")
+                probabilities.append(float(self.model(tensor, RATE).item()))
+        return bool(probabilities) and max(probabilities) >= self.threshold
+
 
 class RealTimePipeline:
-    def __init__(self):
+    def __init__(self, enable_vad=True, enable_osc=True, enable_prompt_budget=True):
         self.backend = TRANSCRIPTION_BACKEND
         self.model = None
         self.online_recognizer = None
@@ -227,16 +320,18 @@ class RealTimePipeline:
         self.argos_translate = None
         self.local_translation_cache = {}
 
-        if self.backend == "whisper":
+        if self.backend in {"whisper", "faster_whisper"}:
             if torch is None:
                 raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=whisper requires torch. Run: pip install -r requirements.txt"
+                    f"TRANSCRIPTION_BACKEND={self.backend} requires torch. Run: pip install -r requirements.txt"
                 ) from TORCH_IMPORT_ERROR
             if not DEVICE.startswith("cuda") or not torch.cuda.is_available():
                 raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=whisper is configured to require a CUDA GPU. "
+                    f"TRANSCRIPTION_BACKEND={self.backend} is configured to require a CUDA GPU. "
                     "Use TRANSCRIPTION_BACKEND=groq for online translation without local GPU usage."
                 )
+
+        if self.backend == "whisper":
             try:
                 import whisper
             except ImportError as exc:
@@ -247,6 +342,32 @@ class RealTimePipeline:
 
             print(f"Loading Whisper model '{MODEL_SIZE}' on {DEVICE}...")
             self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+        elif self.backend == "faster_whisper":
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "TRANSCRIPTION_BACKEND=faster_whisper requires faster-whisper. "
+                    "Run: pip install -r requirements.txt"
+                ) from exc
+
+            print(
+                f"Loading faster-whisper model '{MODEL_SIZE}' on {DEVICE} "
+                f"({FASTER_WHISPER_COMPUTE_TYPE})..."
+            )
+            try:
+                self.model = WhisperModel(
+                    MODEL_SIZE,
+                    device=DEVICE,
+                    compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+                    cpu_threads=FASTER_WHISPER_CPU_THREADS,
+                    num_workers=FASTER_WHISPER_NUM_WORKERS,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "faster-whisper could not initialize CUDA. This project pins CTranslate2 for "
+                    "CUDA 12 with cuDNN 8; verify that the NVIDIA libraries are available on PATH."
+                ) from exc
         elif self.backend in {"groq", "groq_hybrid"}:
             if not GROQ_API_KEY:
                 raise RuntimeError(
@@ -269,22 +390,71 @@ class RealTimePipeline:
             print("Note: this sends microphone audio to Google's speech service and does not translate to English.")
             self.online_recognizer = sr.Recognizer()
 
-        self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
-        
-        self.audio_buffer = []
-        self.audio_version = 0
-        self.last_submitted_audio_version = 0
+        self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT) if enable_osc else None
+        self.vad = self.create_voice_activity_detector() if enable_vad else None
+        self.segmenter = AudioSegmenter(
+            sample_rate=RATE,
+            chunk_samples=CHUNK,
+            pre_roll_seconds=VAD_PRE_ROLL_SECONDS,
+            end_silence_seconds=VAD_SILENCE_SECONDS,
+            max_segment_seconds=self.maximum_audio_seconds(),
+            overlap_seconds=max(0.0, min(STREAM_OVERLAP_SECONDS, self.maximum_audio_seconds() / 2)),
+        )
+        self.completed_segments = queue.Queue()
+        self.stabilizers = {}
+        self.scene_memory = RollingSceneMemory(
+            max_words=SCENE_MEMORY_MAX_WORDS,
+            max_age_seconds=SCENE_MEMORY_MAX_AGE_SECONDS,
+        )
+        self.prompt_budgeter = self.create_prompt_budgeter() if enable_prompt_budget else None
+        self.last_prompt_token_count = 0
+        self.last_prompt_variant = "unbudgeted"
+        self.last_prompt_trimmed = False
+        self.last_partial_key = None
         self.last_text = ""
         self.is_running = True
-        self.last_speech_time = time.time()
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
         self.current_visual_mode = CURRENT_VISUAL_MODE
         self.current_prompt_style = CURRENT_PROMPT_STYLE
-        self.current_language = None # Default to Auto
-        
+        self.current_language = None  # Default to Auto
         self.lock = threading.Lock()
-        
+
+    def create_prompt_budgeter(self):
+        if not PROMPT_TOKEN_BUDGET_ENABLED:
+            print("Prompt token budgeting is disabled.")
+            return None
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizers = [AutoTokenizer.from_pretrained(model) for model in PROMPT_TOKENIZER_MODELS]
+            print(
+                f"Using {len(tokenizers)} SDXL CLIP tokenizer(s) "
+                f"with a {PROMPT_MAX_TOKENS}-token prompt limit."
+            )
+            return PromptBudgeter(
+                tokenizers,
+                max_tokens=PROMPT_MAX_TOKENS,
+                min_transcript_tokens=PROMPT_MIN_TRANSCRIPT_TOKENS,
+            )
+        except Exception as exc:
+            print(f"[PROMPT BUDGET]: Tokenizers unavailable ({exc}). Prompts will not be token-limited.")
+            return None
+
+    def create_voice_activity_detector(self):
+        if VAD_ENGINE == "silero":
+            try:
+                detector = SileroVoiceActivityDetector(VAD_THRESHOLD)
+                print(f"Using Silero VAD on CPU (threshold {VAD_THRESHOLD:.2f}).")
+                return detector
+            except Exception as exc:
+                print(f"[VAD]: Silero unavailable ({exc}). Falling back to energy detection.")
+        elif VAD_ENGINE != "energy":
+            print(f"[VAD]: Unknown engine '{VAD_ENGINE}'. Falling back to energy detection.")
+
+        print(f"Using energy VAD (threshold {VAD_ENERGY_THRESHOLD:.0f}).")
+        return EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+
     def audio_callback(self):
         p = pyaudio.PyAudio()
         stream = p.open(format=FORMAT,
@@ -299,22 +469,17 @@ class RealTimePipeline:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 audio_data = np.frombuffer(data, dtype=np.int16)
-                avg_vol = np.abs(audio_data).mean()
-                
+                try:
+                    is_speech = self.vad.is_speech(audio_data)
+                except Exception as exc:
+                    print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
+                    self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+                    is_speech = self.vad.is_speech(audio_data)
+
                 with self.lock:
-                    if avg_vol > SILENCE_THRESHOLD:
-                        self.audio_buffer.append(audio_data)
-                        self.audio_version += 1
-                        self.last_speech_time = time.time()
-                        # Keep buffer at max 12 seconds for SDXL token safety
-                        if len(self.audio_buffer) > (12 * RATE / CHUNK):
-                            self.audio_buffer.pop(0)
-                    else:
-                        # If silent for too long, clear the buffer to stop hallucinations
-                        if time.time() - self.last_speech_time > SILENCE_TIMEOUT:
-                            if self.audio_buffer:
-                                self.audio_buffer = []
-                                self.last_text = ""
+                    completed = self.segmenter.add_chunk(audio_data, is_speech)
+                for segment in completed:
+                    self.completed_segments.put(segment)
             except Exception as e:
                 print(f"Audio Error: {e}")
 
@@ -324,69 +489,178 @@ class RealTimePipeline:
 
     def transcription_loop(self):
         while self.is_running:
-            time.sleep(0.6) 
-            
-            with self.lock:
-                min_audio_seconds = self.minimum_audio_seconds()
-                if len(self.audio_buffer) < (min_audio_seconds * RATE / CHUNK):
+            now = time.time()
+            if self.backend in {"groq", "groq_hybrid", "google"}:
+                if now - self.last_online_request_time < self.online_request_interval():
+                    time.sleep(0.05)
                     continue
-                audio_version = self.audio_version
-                if audio_version == self.last_submitted_audio_version:
+
+            completed = False
+            try:
+                segment = self.completed_segments.get_nowait()
+                completed = True
+            except queue.Empty:
+                segment = None
+
+            if segment is None:
+                if now - self.last_whisper_request_time < self.local_request_interval():
+                    time.sleep(0.05)
                     continue
-                full_audio = np.concatenate(self.audio_buffer).copy()
+                with self.lock:
+                    segment = self.segmenter.snapshot(self.minimum_audio_seconds())
+                if segment is None:
+                    time.sleep(0.05)
+                    continue
+                partial_key = (segment.segment_id, segment.version)
+                if partial_key == self.last_partial_key:
+                    time.sleep(0.05)
+                    continue
+                self.last_partial_key = partial_key
 
             if self.backend in {"groq", "groq_hybrid", "google"}:
-                now = time.time()
-                if now - self.last_online_request_time < self.online_request_interval():
-                    continue
-                self.last_online_request_time = now
-                full_audio = self.limit_online_audio_window(full_audio)
-            elif self.backend == "whisper":
-                now = time.time()
-                if now - self.last_whisper_request_time < WHISPER_TRANSCRIPTION_INTERVAL:
-                    continue
-                self.last_whisper_request_time = now
-                full_audio = self.limit_whisper_audio_window(full_audio)
+                self.last_online_request_time = time.time()
+            else:
+                self.last_whisper_request_time = time.time()
 
-            self.last_submitted_audio_version = audio_version
-            
-            text = self.transcribe_audio(full_audio)
-            
-            # Filter out common recognizer hallucinations
+            try:
+                text = self.transcribe_audio(segment.samples)
+            except Exception as exc:
+                print(f"\n[TRANSCRIPTION ERROR]: {exc}")
+                if segment.is_final:
+                    self.stabilizers.pop(segment.segment_id, None)
+                    if completed:
+                        self.completed_segments.task_done()
+                continue
             hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
             if any(h.lower() in text.lower() for h in hallucinations):
-                continue
+                text = ""
 
-            if text and text != self.last_text:
-                self.last_text = text
-                final_prompt = self.build_visual_prompt(text)
-                
-                self.osc_client.send_message("/prompt", final_prompt)
-                self.osc_client.send_message("/partial_text", text)
-                
-                sys.stdout.write(f"\r[PROMPT]: {text[:80]}...         ")
-                sys.stdout.flush()
+            stabilizer = self.stabilizers.setdefault(
+                segment.segment_id,
+                TranscriptStabilizer(TRANSCRIPT_CONFIRM_UPDATES),
+            )
+            update = stabilizer.update(text, is_final=segment.is_final)
+            scene_text = ""
+            if update.text:
+                scene_text = self.scene_memory.update(
+                    segment.segment_id,
+                    update.text,
+                    is_final=update.is_final,
+                )
+            if scene_text and (update.changed or update.is_final):
+                self.emit_transcript(
+                    scene_text,
+                    raw_text=update.text,
+                    is_final=update.is_final,
+                )
+
+            if segment.is_final:
+                self.stabilizers.pop(segment.segment_id, None)
+                if completed:
+                    self.completed_segments.task_done()
+
+    def emit_transcript(self, text, raw_text=None, is_final=False):
+        if not text:
+            return
+        raw_text = raw_text or text
+        if text == self.last_text:
+            if is_final and self.osc_client is not None:
+                self.osc_client.send_message("/transcript_final", raw_text)
+            return
+        self.last_text = text
+        final_prompt = self.build_visual_prompt(text)
+
+        if self.osc_client is not None:
+            self.osc_client.send_message("/prompt", final_prompt)
+            self.osc_client.send_message("/partial_text", raw_text)
+            self.osc_client.send_message("/scene_context", text)
+            self.osc_client.send_message("/prompt_tokens", self.last_prompt_token_count)
+            if is_final:
+                self.osc_client.send_message("/transcript_final", raw_text)
+
+        state = "FINAL" if is_final else "STABLE"
+        print(f"\n[PROMPT {state}]: {text}")
+        if raw_text != text:
+            print(f"[CURRENT TRANSCRIPT]: {raw_text}")
 
     def build_visual_prompt(self, text):
         visual_mode = VISUAL_MODES.get(self.current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
-        prompt_style = PROMPT_STYLES.get(self.current_prompt_style, PROMPT_STYLES[CURRENT_PROMPT_STYLE])
 
         if self.current_prompt_style == "general_scene":
-            return prompt_style["template"].format(
-                text=text,
-                visual_context=visual_mode["scene_context"],
+            variants = [
+                (
+                    "full",
+                    lambda value: SCENE_PROMPT_TEMPLATE.format(
+                        text=value,
+                        visual_context=visual_mode["scene_context"],
+                    ),
+                ),
+                (
+                    "compact_context",
+                    lambda value: SCENE_PROMPT_TEMPLATE.format(
+                        text=value,
+                        visual_context=visual_mode["compact_scene_context"],
+                    ),
+                ),
+                (
+                    "compact",
+                    lambda value: COMPACT_SCENE_PROMPT_TEMPLATE.format(
+                        text=value,
+                        visual_context=visual_mode["compact_scene_context"],
+                    ),
+                ),
+            ]
+        else:
+            gender_focus = GENDER_MODES.get(self.current_gender, "person")
+            age_desc = AGE_MODES.get(self.current_age, "")
+            subject_focus = f"{visual_mode['subject_prefix']} {gender_focus}"
+            variants = [
+                (
+                    "full",
+                    lambda value: FIXED_PROMPT_TEMPLATE.format(
+                        age_desc=age_desc,
+                        subject_focus=subject_focus,
+                        visual_context=visual_mode["context"],
+                        text=value,
+                    ),
+                ),
+                (
+                    "compact_context",
+                    lambda value: FIXED_PROMPT_TEMPLATE.format(
+                        age_desc=age_desc,
+                        subject_focus=subject_focus,
+                        visual_context=visual_mode["compact_context"],
+                        text=value,
+                    ),
+                ),
+                (
+                    "compact",
+                    lambda value: COMPACT_FIXED_PROMPT_TEMPLATE.format(
+                        age_desc=age_desc,
+                        subject_focus=subject_focus,
+                        visual_context=visual_mode["compact_context"],
+                        text=value,
+                    ),
+                ),
+            ]
+
+        if self.prompt_budgeter is None:
+            self.last_prompt_token_count = 0
+            self.last_prompt_variant = "unbudgeted"
+            self.last_prompt_trimmed = False
+            return variants[0][1](text)
+
+        result = self.prompt_budgeter.fit(variants, text)
+        self.last_prompt_token_count = result.token_count
+        self.last_prompt_variant = result.variant
+        self.last_prompt_trimmed = result.transcript_trimmed
+        if PROMPT_LOG_TOKENS:
+            trimmed = ", newest transcript retained" if result.transcript_trimmed else ""
+            print(
+                f"\n[PROMPT TOKENS]: {result.token_count}/{PROMPT_MAX_TOKENS} "
+                f"({result.variant}{trimmed})"
             )
-
-        gender_focus = GENDER_MODES.get(self.current_gender, "person")
-        age_desc = AGE_MODES.get(self.current_age, "")
-        subject_focus = f"{visual_mode['subject_prefix']} {gender_focus}"
-
-        return prompt_style["template"].format(
-            age_desc=age_desc,
-            subject_focus=subject_focus,
-            visual_context=visual_mode["context"],
-            text=text,
-        )
+        return result.text
 
     def transcribe_audio(self, audio_samples):
         if self.backend == "groq":
@@ -395,6 +669,8 @@ class RealTimePipeline:
             return self.transcribe_groq_hybrid(audio_samples)
         if self.backend == "google":
             return self.transcribe_google(audio_samples)
+        if self.backend == "faster_whisper":
+            return self.transcribe_faster_whisper(audio_samples)
         return self.transcribe_whisper(audio_samples)
 
     def minimum_audio_seconds(self):
@@ -409,18 +685,17 @@ class RealTimePipeline:
             return GROQ_TRANSCRIPTION_INTERVAL
         return GOOGLE_TRANSCRIPTION_INTERVAL
 
-    def limit_online_audio_window(self, audio_samples):
-        max_seconds = GROQ_MAX_AUDIO_SECONDS if self.backend in {"groq", "groq_hybrid"} else GOOGLE_MAX_AUDIO_SECONDS
-        max_samples = int(max_seconds * RATE)
-        if max_samples <= 0 or len(audio_samples) <= max_samples:
-            return audio_samples
-        return audio_samples[-max_samples:]
+    def local_request_interval(self):
+        if self.backend in {"whisper", "faster_whisper"}:
+            return WHISPER_TRANSCRIPTION_INTERVAL
+        return 0.0
 
-    def limit_whisper_audio_window(self, audio_samples):
-        max_samples = int(WHISPER_MAX_AUDIO_SECONDS * RATE)
-        if max_samples <= 0 or len(audio_samples) <= max_samples:
-            return audio_samples
-        return audio_samples[-max_samples:]
+    def maximum_audio_seconds(self):
+        if self.backend in {"groq", "groq_hybrid"}:
+            return max(1.0, GROQ_MAX_AUDIO_SECONDS)
+        if self.backend == "google":
+            return max(1.0, GOOGLE_MAX_AUDIO_SECONDS)
+        return max(1.0, WHISPER_MAX_AUDIO_SECONDS)
 
     def transcribe_whisper(self, audio_samples):
         full_audio = audio_samples.astype(np.float32) / 32768.0
@@ -439,11 +714,30 @@ class RealTimePipeline:
         if WHISPER_LOG_LATENCY:
             print(f"\n[WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
 
-        # Reverse segments so the latest speech has more weight at the start of the SDXL prompt.
         segments = result.get("segments", [])
         if segments:
-            return " ".join([s["text"].strip() for s in reversed(segments)])
+            return " ".join(s["text"].strip() for s in segments if s["text"].strip())
         return result["text"].strip()
+
+    def transcribe_faster_whisper(self, audio_samples):
+        full_audio = audio_samples.astype(np.float32) / 32768.0
+        started = time.perf_counter()
+        segments, _ = self.model.transcribe(
+            full_audio,
+            task="translate",
+            language=self.current_language,
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEST_OF,
+            temperature=WHISPER_TEMPERATURE,
+            condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+            vad_filter=False,
+            word_timestamps=False,
+        )
+        segments = list(segments)
+        elapsed = time.perf_counter() - started
+        if WHISPER_LOG_LATENCY:
+            print(f"\n[FASTER-WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
+        return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
 
     def transcribe_groq(self, audio_samples):
         wav_bytes = self.encode_wav(audio_samples)
@@ -747,6 +1041,60 @@ class RealTimePipeline:
             return GOOGLE_LANGUAGE_MAP.get(self.current_language, self.current_language)
         return GOOGLE_SPEECH_LANGUAGE
 
+    def benchmark(self, wav_path, runs=3):
+        if self.backend not in {"whisper", "faster_whisper"}:
+            raise RuntimeError("Benchmark mode supports only whisper and faster_whisper backends.")
+
+        samples = self.load_wav_file(wav_path)
+        audio_seconds = len(samples) / RATE
+        runs = max(1, runs)
+        warmup = samples[:min(len(samples), int(2 * RATE))]
+
+        print("\n" + "=" * 50)
+        print(f"LOCAL ASR BENCHMARK: {self.backend}")
+        print(f"Model: {MODEL_SIZE} | Device: {DEVICE} | Audio: {audio_seconds:.2f}s")
+        if self.backend == "faster_whisper":
+            print(f"Compute type: {FASTER_WHISPER_COMPUTE_TYPE}")
+        print("Warming up...")
+        self.transcribe_audio(warmup)
+
+        latencies = []
+        for run_number in range(1, runs + 1):
+            started = time.perf_counter()
+            text = self.transcribe_audio(samples)
+            elapsed = time.perf_counter() - started
+            latencies.append(elapsed)
+            rtf = elapsed / audio_seconds
+            print(f"Run {run_number}: {elapsed:.3f}s | real-time factor {rtf:.3f} | {len(text)} chars")
+
+        average = sum(latencies) / len(latencies)
+        print(f"Average: {average:.3f}s | real-time factor {average / audio_seconds:.3f}")
+        print("=" * 50)
+
+    @staticmethod
+    def load_wav_file(wav_path):
+        with wave.open(wav_path, "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            source_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            raw_audio = wav_file.readframes(frame_count)
+
+        if sample_width != 2:
+            raise ValueError("Benchmark WAV must use 16-bit PCM audio.")
+
+        samples = np.frombuffer(raw_audio, dtype=np.int16)
+        if channels > 1:
+            samples = samples.reshape(-1, channels).astype(np.int32).mean(axis=1).astype(np.int16)
+        if source_rate != RATE:
+            target_length = max(1, round(len(samples) * RATE / source_rate))
+            source_positions = np.linspace(0, len(samples) - 1, num=len(samples))
+            target_positions = np.linspace(0, len(samples) - 1, num=target_length)
+            samples = np.interp(target_positions, source_positions, samples).astype(np.int16)
+        if samples.size == 0:
+            raise ValueError("Benchmark WAV contains no audio samples.")
+        return samples
+
     def start(self):
         t1 = threading.Thread(target=self.audio_callback, daemon=True)
         t2 = threading.Thread(target=self.transcription_loop, daemon=True)
@@ -756,6 +1104,7 @@ class RealTimePipeline:
         
         try:
             print("\n" + "="*50)
+            print(f"BACKEND: {self.backend} | VAD: {VAD_ENGINE} | CONFIRMATIONS: {TRANSCRIPT_CONFIRM_UPDATES}")
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
@@ -819,9 +1168,19 @@ class RealTimePipeline:
                         print(f"\n[MODE]: LANG -> AUTO-DETECT")
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            self.is_running = False
             print("\nShutting down...")
+        finally:
+            self.is_running = False
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
 
 if __name__ == "__main__":
-    pipeline = RealTimePipeline()
-    pipeline.start()
+    pipeline = RealTimePipeline(
+        enable_vad=not bool(ARGS.benchmark),
+        enable_osc=not bool(ARGS.benchmark),
+        enable_prompt_budget=not bool(ARGS.benchmark),
+    )
+    if ARGS.benchmark:
+        pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
+    else:
+        pipeline.start()

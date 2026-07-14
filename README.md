@@ -1,26 +1,25 @@
 # Voice-to-Visual Pipeline for StreamDiffusionTD
 
-A real-time bridge between spoken language and high-speed generative visuals. This project uses **OpenAI Whisper** for transcription and a multi-stage **LLM Orchestrator** to transform continuous speech into optimized SDXL prompts for **StreamDiffusionTD**.
+A real-time bridge between spoken language and high-speed generative visuals. The project supports optimized local GPU Whisper, the original OpenAI Whisper runtime, and hosted transcription backends, then turns stable speech updates into SDXL prompts for **StreamDiffusionTD**.
 
 ## 🚀 Features
 
 - **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals, Black and Brown people visuals, or combined Asian + Black and Brown visuals.
 - **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
 - **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode in real-time.
-- **Responsive Prompt Reversal**: Automatically reverses the order of spoken sentences so the **most recent speech** is placed at the start of the prompt for immediate visual feedback.
-- **Live Transcription**: Selectable audio-to-text using local GPU **OpenAI Whisper** (Small model by default for faster response), online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
+- **Stable Streaming Transcription**: Confirms the word prefix shared by consecutive hypotheses, reducing repeated text and prompt flicker.
+- **Rolling Scene Memory**: Removes overlap between audio segments and carries the newest subjects, places, and actions across prompt updates.
+- **Live Transcription**: Selectable audio-to-text using optimized local GPU **faster-whisper**, the original local GPU **OpenAI Whisper**, online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
-- **Voice Activity Detection (VAD)**: Smart volume gating and a 5-second auto-reset timer to prevent "ghost" transcriptions and hallucinations.
-- **Token Management**: 12-second rolling buffer to ensure prompts stay within SDXL's 77-token limit.
+- **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
+- **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
+- **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Real-time Integration**: Ultra-fast OSC updates to TouchDesigner for instantaneous visual feedback.
 
 ## 🛠️ Tech Stack
 
-- **Transcription**: `openai-whisper` (Small Model, CUDA GPU default), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
-- **LLM Orchestration**: 
-    1. **Gemini 3 Flash Preview** (Primary)
-    2. **Kimi k2.6** (Fallback 1)
-    3. **Gemma 4 (31b)** (Fallback 2)
+- **Transcription**: `faster-whisper` (recommended Small model on CUDA), `openai-whisper` (preserved local backend), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
+- **Optional LLM Orchestration**: `orchestrator.py` can refine a single prompt through its configured Ollama model sequence. The live `transcriber.py` path uses the fixed prompt templates directly.
 - **Visual Engine**: StreamDiffusion (SDXL-Turbo/Lightning)
 - **Bridge**: TouchDesigner (via OSC on Port 7000)
 - **Language**: Python 3.10+
@@ -28,6 +27,8 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 ## 🎨 Fixed Prompt Strategy
 
 The system keeps the original human-focused template and adds a second scene-focused template for moments when you want the visuals to describe a place, mood, or environment instead of centering a person.
+
+Both original templates remain available as the high-detail variants. When a complete prompt would exceed SDXL's context window, the bridge automatically uses a compact equivalent and retains the newest transcript details. Token limits are checked against both SDXL text encoders.
 
 Human figure focus:
 
@@ -104,11 +105,15 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     Optional live transcription settings:
 
     ```env
-    # Default: local Whisper, best multilingual translation, requires a CUDA GPU.
-    TRANSCRIPTION_BACKEND=whisper
+    # Recommended default: optimized local Whisper translation on a CUDA GPU.
+    TRANSCRIPTION_BACKEND=faster_whisper
     WHISPER_MODEL_SIZE=small
     WHISPER_DEVICE=cuda
-    # Local Whisper speed/latency tuning. Use small/base for faster but lower-quality output.
+    # faster-whisper runs on the GPU while int8_float16 reduces its memory footprint.
+    FASTER_WHISPER_COMPUTE_TYPE=int8_float16
+    FASTER_WHISPER_CPU_THREADS=4
+    FASTER_WHISPER_NUM_WORKERS=1
+    # Shared local Whisper speed/latency tuning. Use small/base for faster but lower-quality output.
     WHISPER_TRANSCRIPTION_INTERVAL=0.8
     WHISPER_MIN_AUDIO_SECONDS=0.8
     WHISPER_MAX_AUDIO_SECONDS=6.0
@@ -117,6 +122,26 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     WHISPER_TEMPERATURE=0.0
     WHISPER_CONDITION_ON_PREVIOUS_TEXT=false
     WHISPER_LOG_LATENCY=true
+
+    # CPU VAD and stable streaming settings.
+    VAD_ENGINE=silero
+    VAD_THRESHOLD=0.5
+    VAD_ENERGY_THRESHOLD=400
+    VAD_PRE_ROLL_SECONDS=0.32
+    VAD_SILENCE_SECONDS=0.7
+    STREAM_OVERLAP_SECONDS=0.5
+    TRANSCRIPT_CONFIRM_UPDATES=2
+
+    # Keep recent scene details while removing repeated overlap between segments.
+    SCENE_MEMORY_MAX_WORDS=36
+    SCENE_MEMORY_MAX_AGE_SECONDS=20
+
+    # Enforce both SDXL CLIP encoders' prompt limit.
+    PROMPT_TOKEN_BUDGET_ENABLED=true
+    PROMPT_MAX_TOKENS=77
+    PROMPT_MIN_TRANSCRIPT_TOKENS=20
+    PROMPT_LOG_TOKENS=true
+    PROMPT_TOKENIZER_MODELS=openai/clip-vit-large-patch14,laion/CLIP-ViT-bigG-14-laion2B-39B-b160k
 
     # Recommended online option for StreamDiffusion: multilingual audio -> English prompt text.
     # Uses Groq's hosted Whisper translation endpoint. The free plan has rate limits.
@@ -169,11 +194,16 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
     To choose a backend for just one run without editing `.env`:
     ```powershell
+    python transcriber.py --backend faster_whisper
+    python transcriber.py --backend whisper
     python transcriber.py --backend groq
     python transcriber.py --backend groq_hybrid
-    python transcriber.py --backend whisper
     ```
-    `groq` uses online multilingual translation and does not load local Whisper. `groq_hybrid` uses Groq turbo for online transcription, then translates non-English text locally on CPU with Argos Translate when available. If local translation is unavailable or still returns Chinese/Cantonese text, `HYBRID_TRANSLATION_FALLBACK=groq_text` sends only the transcript text through a fast Groq chat model for English cleanup. `whisper` uses local OpenAI Whisper on CUDA GPU. If Groq audio translation returns Chinese/Cantonese text, `GROQ_ENGLISH_FALLBACK=auto` sends that text through a fast Groq chat model for an English prompt. For the lowest latency, local Whisper is usually better because it avoids network round trips. You can make local Whisper faster by lowering `WHISPER_MODEL_SIZE` to `small` or `base`, reducing `WHISPER_MAX_AUDIO_SECONDS`, or increasing `WHISPER_TRANSCRIPTION_INTERVAL`.
+    `faster_whisper` uses CTranslate2 on the CUDA GPU and is the recommended local mode when StreamDiffusion shares the same GPU. `whisper` preserves the original OpenAI Whisper CUDA implementation. Both auto-detect multilingual audio and use Whisper's `translate` task to produce English. `groq` uses online multilingual translation and does not load local Whisper. `groq_hybrid` uses Groq turbo for online transcription, then translates non-English text locally on CPU with Argos Translate when available. If local translation is unavailable or still returns Chinese/Cantonese text, `HYBRID_TRANSLATION_FALLBACK=groq_text` sends only the transcript text through a fast Groq chat model for English cleanup.
+
+    The dependency file pins CTranslate2 `4.4.0` for this project's current Windows CUDA 12 + cuDNN 8 setup. Silero VAD runs on the CPU. If Silero cannot load, the script reports the problem and automatically uses the energy detector.
+
+    The first `faster_whisper` run downloads and caches its converted Whisper model. Prompt budgeting also caches two small tokenizer configurations. Later launches reuse both local caches.
 
     You can also override the backend for the current PowerShell session:
     ```powershell
@@ -181,6 +211,25 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     python transcriber.py
     ```
 3.  **Speak & Control**: The system will automatically capture your speech. Use the keys above to shift the identity of the generated figures as you talk.
+
+The OSC bridge continues to send `/prompt` and `/partial_text`. It also sends `/scene_context`, `/prompt_tokens`, and `/transcript_final` so TouchDesigner can display merged context, monitor the prompt budget, or react only to finalized speech.
+
+## Local Performance Benchmark
+
+Compare the two local GPU engines with the same 16-bit PCM WAV recording:
+
+```powershell
+python transcriber.py --backend faster_whisper --benchmark .\sample.wav --benchmark-runs 3
+python transcriber.py --backend whisper --benchmark .\sample.wav --benchmark-runs 3
+```
+
+The benchmark performs one warm-up pass, then reports latency and real-time factor for each measured run. A real-time factor below `1.0` means transcription is faster than the recording duration.
+
+Run the streaming logic tests without loading a Whisper model:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## 📜 License
 
