@@ -2,7 +2,7 @@
 
 A real-time bridge between spoken language and high-speed generative visuals. The project supports optimized local GPU Whisper, the original OpenAI Whisper runtime, and hosted transcription backends, then turns stable speech updates into SDXL prompts for **StreamDiffusionTD**.
 
-## 🚀 Features
+## Features
 
 - **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals, Black and Brown people visuals, or combined Asian + Black and Brown visuals.
 - **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
@@ -13,18 +13,21 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
+- **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
+- **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
-- **Real-time Integration**: Ultra-fast OSC updates to TouchDesigner for instantaneous visual feedback.
+- **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
+- **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 - **Transcription**: `faster-whisper` (recommended Small model on CUDA), `openai-whisper` (preserved local backend), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
 - **Optional LLM Orchestration**: `orchestrator.py` can refine a single prompt through its configured Ollama model sequence. The live `transcriber.py` path uses the fixed prompt templates directly.
 - **Visual Engine**: StreamDiffusion (SDXL-Turbo/Lightning)
-- **Bridge**: TouchDesigner (via OSC on Port 7000)
+- **Bridge**: TouchDesigner via OSC output on port 7000 and control input on port 7001
 - **Language**: Python 3.10+
 
-## 🎨 Fixed Prompt Strategy
+## Fixed Prompt Strategy
 
 The system keeps the original human-focused template and adds a second scene-focused template for moments when you want the visuals to describe a place, mood, or environment instead of centering a person.
 
@@ -44,7 +47,7 @@ A hyper-realistic photorealistic cinematic scene of {text}, {scene identity cont
 environment-focused composition, no central human figure, no portrait framing, 8k UHD, highly detailed...
 ```
 
-## 🎮 Interactive Controls
+## Interactive Controls
 
 While `transcriber.py` is running, you can use the following keyboard shortcuts to adjust the visuals live:
 
@@ -66,7 +69,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | | `s` | Force **Spanish** transcription |
 | | `a` | **Auto-detect** language (Default) |
 
-## 📦 Installation
+## Installation
 
 1.  **Clone the repository**:
     ```bash
@@ -132,6 +135,22 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     STREAM_OVERLAP_SECONDS=0.5
     TRANSCRIPT_CONFIRM_UPDATES=2
 
+    # Bounded scheduler: finals have priority and obsolete partials are replaced.
+    TRANSCRIPTION_MAX_FINAL_JOBS=8
+    TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS=4.0
+    TRANSCRIPTION_FINAL_MAX_AGE_SECONDS=30.0
+    TRANSCRIPTION_FINAL_MAX_RETRIES=2
+    TRANSCRIPTION_RETRY_BASE_SECONDS=1.0
+    TRANSCRIPTION_RETRY_MAX_SECONDS=10.0
+
+    # OSC output and optional OSC controls/status for TouchDesigner.
+    OSC_IP=127.0.0.1
+    OSC_PORT=7000
+    OSC_CONTROL_ENABLED=true
+    OSC_CONTROL_IP=127.0.0.1
+    OSC_CONTROL_PORT=7001
+    OSC_STATUS_INTERVAL=0.5
+
     # Keep recent scene details while removing repeated overlap between segments.
     SCENE_MEMORY_MAX_WORDS=36
     SCENE_MEMORY_MAX_AGE_SECONDS=20
@@ -157,13 +176,14 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     # GROQ_TRANSCRIPTION_INTERVAL=3.2
     # GROQ_MIN_AUDIO_SECONDS=1.0
     # GROQ_MAX_AUDIO_SECONDS=6.0
+    # GROQ_REQUEST_TIMEOUT=20.0
     # GROQ_LOG_LATENCY=true
 
     # Experimental hybrid mode:
     # Groq turbo transcribes online, then Argos Translate translates non-English text locally on CPU.
     # This may be faster than Groq audio translation, but quality depends on the local translator.
     # Whisper cannot do this local text translation step; Whisper only translates audio.
-    # If Argos is not installed or cannot load, hybrid mode still transcribes but passes non-English text through.
+    # If Argos cannot translate, groq_text optionally provides an online text-only fallback.
     # TRANSCRIPTION_BACKEND=groq_hybrid
     # GROQ_HYBRID_MODEL=whisper-large-v3-turbo
     # LOCAL_TRANSLATOR=argos
@@ -172,11 +192,13 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     # LOCAL_TRANSLATOR_PRELOAD_LANGUAGES=zh,es
     # LOCAL_TRANSLATOR_AUTO_INSTALL=true
     # LOCAL_TRANSLATOR_LOG_LATENCY=true
+    # Use groq_text for fallback, or off to keep translation local-only.
     # HYBRID_TRANSLATION_FALLBACK=groq_text
 
-    # Current Groq free-plan limits for whisper-large-v3:
+    # Published base limits for both Groq Whisper models:
     # 20 requests/minute, 2,000 requests/day,
     # 7,200 audio seconds/hour, 28,800 audio seconds/day.
+    # Your Groq Console Limits page is authoritative for your organization.
 
     # Recognition-only online experiment. This does not translate to English.
     # TRANSCRIPTION_BACKEND=google
@@ -185,10 +207,17 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     # GOOGLE_SPEECH_SPANISH_LANGUAGE=es-ES
     ```
 
-## 🕹️ Usage
+    Groq documents the same base speech limits for `whisper-large-v3` and `whisper-large-v3-turbo`, but limits apply at the organization level. Check the [Groq rate-limit documentation](https://console.groq.com/docs/rate-limits) and your Console Limits page for the current values assigned to your account.
 
-1.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
-2.  **Start the Pipeline with your `.env` default**:
+## Usage
+
+1.  **Check the machine once after setup or dependency changes**:
+    ```powershell
+    python transcriber.py --diagnose
+    ```
+    Diagnostics report only whether credentials are configured; they never print credential values.
+2.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
+3.  **Start the Pipeline with your `.env` default**:
     ```bash
     python transcriber.py
     ```
@@ -210,9 +239,50 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     $env:TRANSCRIPTION_BACKEND = "groq"
     python transcriber.py
     ```
-3.  **Speak & Control**: The system will automatically capture your speech. Use the keys above to shift the identity of the generated figures as you talk.
+4.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
 
-The OSC bridge continues to send `/prompt` and `/partial_text`. It also sends `/scene_context`, `/prompt_tokens`, and `/transcript_final` so TouchDesigner can display merged context, monitor the prompt budget, or react only to finalized speech.
+### OSC Output to TouchDesigner
+
+| Address | Value |
+| :--- | :--- |
+| `/prompt` | Complete SDXL prompt |
+| `/partial_text` | Current stable transcript |
+| `/scene_context` | Rolling merged scene text |
+| `/prompt_tokens` | Maximum token count across both SDXL text encoders |
+| `/transcript_final` | Finalized transcript segment |
+| `/backend_status` | `ready`, `transcribing`, `retrying`, `error`, or `stopped` |
+| `/is_speaking` | `1` while VAD detects an active speech segment, otherwise `0` |
+| `/queue_depth` | Pending final jobs plus the newest pending partial |
+| `/latency_total` | Seconds from scheduler submission through completed transcription |
+| `/latency_asr` | Seconds spent in the active ASR/translation call |
+| `/retry_in` | Seconds until a rate-limited or transiently unavailable backend may be called again |
+| `/dropped_jobs` | Total stale or capacity-dropped jobs |
+
+### OSC Input from TouchDesigner
+
+Send these messages to `127.0.0.1:7001`. Text values accept the names below or the equivalent keyboard key.
+
+| Address | Accepted values |
+| :--- | :--- |
+| `/control/gender` | `man`, `woman`, `neutral` |
+| `/control/age` | `young`, `adult`, `elder` |
+| `/control/visual_mode` | `asian_american`, `black_brown`, `asian_black_brown` |
+| `/control/prompt_style` | `human_focus`, `general_scene` |
+| `/control/language` | `en`, `zh`, `es`, `auto` |
+| `/control/reset_scene` | Any value; clears rolling scene memory |
+| `/control/request_status` | Any value; immediately emits all runtime status addresses |
+
+Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`.
+
+## Runtime Structure
+
+- `transcriber.py` coordinates model selection, live transcription, prompt generation, and process lifecycle.
+- `audio_runtime.py` owns CPU voice activity detectors.
+- `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.
+- `backend_errors.py` owns retry timing and `Retry-After` parsing.
+- `osc_control.py` owns the TouchDesigner control server and control aliases.
+- `diagnostics.py` owns the read-only startup health checks.
+- `streaming_core.py` and `prompt_engine.py` own testable speech segmentation, transcript stability, scene memory, and prompt budgeting.
 
 ## Local Performance Benchmark
 
@@ -231,6 +301,6 @@ Run the streaming logic tests without loading a Whisper model:
 python -m unittest discover -s tests -v
 ```
 
-## 📜 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

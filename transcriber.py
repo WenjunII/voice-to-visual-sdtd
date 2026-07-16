@@ -7,11 +7,15 @@ import pyaudio
 import requests
 import threading
 import time
-import queue
 from pythonosc import udp_client
 import msvcrt
 
+from audio_runtime import EnergyVoiceActivityDetector, SileroVoiceActivityDetector
+from backend_errors import RetryableTranscriptionError, exponential_backoff, retry_after_seconds
+from diagnostics import run_diagnostics
+from osc_control import OscControlServer
 from prompt_engine import PromptBudgeter, RollingSceneMemory
+from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -83,6 +87,11 @@ def parse_args():
         default=3,
         help="Number of measured benchmark runs after warm-up (default: 3)."
     )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Check the GPU, microphone, packages, OSC port, model cache, and credential hygiene."
+    )
     return parser.parse_args()
 
 
@@ -138,8 +147,28 @@ PROMPT_TOKENIZER_MODELS = [
     if model.strip()
 ]
 
-OSC_IP = "127.0.0.1"
-OSC_PORT = 7000
+OSC_IP = os.environ.get("OSC_IP", "127.0.0.1")
+OSC_PORT = env_int("OSC_PORT", 7000)
+OSC_CONTROL_ENABLED = env_bool("OSC_CONTROL_ENABLED", True)
+OSC_CONTROL_IP = os.environ.get("OSC_CONTROL_IP", "127.0.0.1")
+OSC_CONTROL_PORT = env_int("OSC_CONTROL_PORT", 7001)
+OSC_STATUS_INTERVAL = max(0.1, env_float("OSC_STATUS_INTERVAL", 0.5))
+
+TRANSCRIPTION_MAX_FINAL_JOBS = max(1, env_int("TRANSCRIPTION_MAX_FINAL_JOBS", 8))
+TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS = max(
+    0.0,
+    env_float("TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS", 4.0),
+)
+TRANSCRIPTION_FINAL_MAX_AGE_SECONDS = max(
+    0.0,
+    env_float("TRANSCRIPTION_FINAL_MAX_AGE_SECONDS", 30.0),
+)
+TRANSCRIPTION_FINAL_MAX_RETRIES = max(0, env_int("TRANSCRIPTION_FINAL_MAX_RETRIES", 2))
+TRANSCRIPTION_RETRY_BASE_SECONDS = max(0.1, env_float("TRANSCRIPTION_RETRY_BASE_SECONDS", 1.0))
+TRANSCRIPTION_RETRY_MAX_SECONDS = max(
+    TRANSCRIPTION_RETRY_BASE_SECONDS,
+    env_float("TRANSCRIPTION_RETRY_MAX_SECONDS", 10.0),
+)
 
 # Online transcription is useful when TouchDesigner/StreamDiffusion needs the GPU.
 # Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
@@ -257,6 +286,24 @@ PROMPT_STYLES = {
     },
 }
 
+KEYBOARD_CONTROLS = {
+    "m": ("gender", "man"),
+    "w": ("gender", "woman"),
+    "n": ("gender", "neutral"),
+    "1": ("age", "young"),
+    "2": ("age", "adult"),
+    "3": ("age", "elder"),
+    "d": ("visual_mode", "asian_american"),
+    "b": ("visual_mode", "black_brown"),
+    "x": ("visual_mode", "asian_black_brown"),
+    "f": ("prompt_style", "human_focus"),
+    "g": ("prompt_style", "general_scene"),
+    "e": ("language", "en"),
+    "c": ("language", "zh"),
+    "s": ("language", "es"),
+    "a": ("language", None),
+}
+
 # Audio recording constants
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -271,50 +318,20 @@ STREAM_OVERLAP_SECONDS = env_float("STREAM_OVERLAP_SECONDS", 0.5)
 TRANSCRIPT_CONFIRM_UPDATES = max(1, env_int("TRANSCRIPT_CONFIRM_UPDATES", 2))
 
 
-class EnergyVoiceActivityDetector:
-    def __init__(self, threshold):
-        self.threshold = threshold
-
-    def is_speech(self, audio_samples):
-        return float(np.abs(audio_samples.astype(np.float32)).mean()) > self.threshold
-
-
-class SileroVoiceActivityDetector:
-    FRAME_SAMPLES = 512
-
-    def __init__(self, threshold):
-        try:
-            import torch as vad_torch
-            from silero_vad import load_silero_vad
-        except ImportError as exc:
-            raise RuntimeError("Silero VAD is not installed") from exc
-
-        self.torch = vad_torch
-        self.threshold = threshold
-        self.model = load_silero_vad(onnx=False)
-        self.model.to("cpu")
-        self.model.eval()
-
-    def is_speech(self, audio_samples):
-        normalized = audio_samples.astype(np.float32) / 32768.0
-        probabilities = []
-        with self.torch.inference_mode():
-            for start in range(0, len(normalized), self.FRAME_SAMPLES):
-                frame = normalized[start:start + self.FRAME_SAMPLES]
-                if len(frame) < self.FRAME_SAMPLES:
-                    frame = np.pad(frame, (0, self.FRAME_SAMPLES - len(frame)))
-                tensor = self.torch.from_numpy(frame).to("cpu")
-                probabilities.append(float(self.model(tensor, RATE).item()))
-        return bool(probabilities) and max(probabilities) >= self.threshold
-
-
 class RealTimePipeline:
-    def __init__(self, enable_vad=True, enable_osc=True, enable_prompt_budget=True):
+    def __init__(
+        self,
+        enable_vad=True,
+        enable_osc=True,
+        enable_prompt_budget=True,
+        enable_osc_controls=True,
+    ):
         self.backend = TRANSCRIPTION_BACKEND
         self.model = None
         self.online_recognizer = None
         self.last_online_request_time = 0
         self.last_whisper_request_time = 0
+        self.backend_retry_not_before = 0.0
         self.http = requests.Session() if self.backend in {"groq", "groq_hybrid"} else None
         self.argos_package = None
         self.argos_translate = None
@@ -391,6 +408,8 @@ class RealTimePipeline:
             self.online_recognizer = sr.Recognizer()
 
         self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT) if enable_osc else None
+        self.osc_control_enabled = bool(enable_osc_controls and OSC_CONTROL_ENABLED)
+        self.osc_control_server = None
         self.vad = self.create_voice_activity_detector() if enable_vad else None
         self.segmenter = AudioSegmenter(
             sample_rate=RATE,
@@ -400,7 +419,11 @@ class RealTimePipeline:
             max_segment_seconds=self.maximum_audio_seconds(),
             overlap_seconds=max(0.0, min(STREAM_OVERLAP_SECONDS, self.maximum_audio_seconds() / 2)),
         )
-        self.completed_segments = queue.Queue()
+        self.scheduler = RealtimeJobScheduler(
+            max_final_jobs=TRANSCRIPTION_MAX_FINAL_JOBS,
+            partial_max_age_seconds=TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS,
+            final_max_age_seconds=TRANSCRIPTION_FINAL_MAX_AGE_SECONDS,
+        )
         self.stabilizers = {}
         self.scene_memory = RollingSceneMemory(
             max_words=SCENE_MEMORY_MAX_WORDS,
@@ -410,15 +433,22 @@ class RealTimePipeline:
         self.last_prompt_token_count = 0
         self.last_prompt_variant = "unbudgeted"
         self.last_prompt_trimmed = False
-        self.last_partial_key = None
         self.last_text = ""
         self.is_running = True
+        self.is_speaking = False
+        self.backend_status = "ready"
+        self.last_inference_latency = 0.0
+        self.last_total_latency = 0.0
+        self.last_status_osc_time = 0.0
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
         self.current_visual_mode = CURRENT_VISUAL_MODE
         self.current_prompt_style = CURRENT_PROMPT_STYLE
         self.current_language = None  # Default to Auto
         self.lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.scene_lock = threading.Lock()
+        self.osc_lock = threading.Lock()
 
     def create_prompt_budgeter(self):
         if not PROMPT_TOKEN_BUDGET_ENABLED:
@@ -444,7 +474,7 @@ class RealTimePipeline:
     def create_voice_activity_detector(self):
         if VAD_ENGINE == "silero":
             try:
-                detector = SileroVoiceActivityDetector(VAD_THRESHOLD)
+                detector = SileroVoiceActivityDetector(VAD_THRESHOLD, sample_rate=RATE)
                 print(f"Using Silero VAD on CPU (threshold {VAD_THRESHOLD:.2f}).")
                 return detector
             except Exception as exc:
@@ -457,96 +487,115 @@ class RealTimePipeline:
 
     def audio_callback(self):
         p = pyaudio.PyAudio()
-        stream = p.open(format=FORMAT,
-                        channels=CHANNELS,
-                        rate=RATE,
-                        input=True,
-                        frames_per_buffer=CHUNK)
-        
-        print("\n>>> Active. Visuals will update when you speak.")
-        
-        while self.is_running:
-            try:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.int16)
+        stream = None
+        try:
+            stream = p.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+            )
+            print("\n>>> Active. Visuals will update when you speak.")
+
+            while self.is_running:
                 try:
-                    is_speech = self.vad.is_speech(audio_data)
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    audio_data = np.frombuffer(data, dtype=np.int16)
+                    try:
+                        is_speech = self.vad.is_speech(audio_data)
+                    except Exception as exc:
+                        print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
+                        self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+                        is_speech = self.vad.is_speech(audio_data)
+
+                    with self.lock:
+                        completed = self.segmenter.add_chunk(audio_data, is_speech)
+                        speaking = self.segmenter.active
+
+                    if speaking != self.is_speaking:
+                        self.is_speaking = speaking
+                        self.send_runtime_status(force=True)
+
+                    now = time.monotonic()
+                    for segment in completed:
+                        if self.scheduler.submit_final(segment, now) is None:
+                            print("\n[SCHEDULER]: Final queue is full; newest final segment was dropped.")
+                    self.send_runtime_status()
                 except Exception as exc:
-                    print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
-                    self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
-                    is_speech = self.vad.is_speech(audio_data)
-
-                with self.lock:
-                    completed = self.segmenter.add_chunk(audio_data, is_speech)
-                for segment in completed:
-                    self.completed_segments.put(segment)
-            except Exception as e:
-                print(f"Audio Error: {e}")
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+                    print(f"\n[AUDIO ERROR]: {exc}")
+                    time.sleep(0.1)
+        except Exception as exc:
+            self.backend_status = "error"
+            self.is_running = False
+            print(f"\n[AUDIO STARTUP ERROR]: {exc}")
+            self.send_runtime_status(force=True)
+        finally:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+            p.terminate()
 
     def transcription_loop(self):
         while self.is_running:
-            now = time.time()
-            if self.backend in {"groq", "groq_hybrid", "google"}:
-                if now - self.last_online_request_time < self.online_request_interval():
-                    time.sleep(0.05)
-                    continue
+            now = time.monotonic()
+            if not self.request_interval_ready(now):
+                self.send_runtime_status()
+                time.sleep(0.05)
+                continue
 
-            completed = False
+            with self.lock:
+                partial = self.segmenter.snapshot(self.minimum_audio_seconds())
+            if partial is not None:
+                self.scheduler.submit_partial(partial, now)
+
+            job = self.scheduler.next_job(now)
+            if job is None:
+                self.send_runtime_status()
+                time.sleep(0.05)
+                continue
+
+            self.mark_request_started(now)
+            self.backend_status = "transcribing"
+            self.send_runtime_status(force=True)
+            started = time.monotonic()
             try:
-                segment = self.completed_segments.get_nowait()
-                completed = True
-            except queue.Empty:
-                segment = None
-
-            if segment is None:
-                if now - self.last_whisper_request_time < self.local_request_interval():
-                    time.sleep(0.05)
-                    continue
-                with self.lock:
-                    segment = self.segmenter.snapshot(self.minimum_audio_seconds())
-                if segment is None:
-                    time.sleep(0.05)
-                    continue
-                partial_key = (segment.segment_id, segment.version)
-                if partial_key == self.last_partial_key:
-                    time.sleep(0.05)
-                    continue
-                self.last_partial_key = partial_key
-
-            if self.backend in {"groq", "groq_hybrid", "google"}:
-                self.last_online_request_time = time.time()
-            else:
-                self.last_whisper_request_time = time.time()
-
-            try:
-                text = self.transcribe_audio(segment.samples)
+                text = self.transcribe_audio(job.segment.samples)
+            except RetryableTranscriptionError as exc:
+                self.handle_retryable_failure(job, exc)
+                continue
             except Exception as exc:
                 print(f"\n[TRANSCRIPTION ERROR]: {exc}")
-                if segment.is_final:
-                    self.stabilizers.pop(segment.segment_id, None)
-                    if completed:
-                        self.completed_segments.task_done()
+                self.scheduler.mark_failed()
+                self.backend_status = "error"
+                self.cleanup_final_job(job)
+                self.send_runtime_status(force=True)
                 continue
+
+            finished = time.monotonic()
+            self.last_inference_latency = finished - started
+            self.last_total_latency = finished - job.created_at
+            self.scheduler.mark_processed()
+            self.backend_status = "ready"
+            self.backend_retry_not_before = 0.0
+
             hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
             if any(h.lower() in text.lower() for h in hallucinations):
                 text = ""
 
             stabilizer = self.stabilizers.setdefault(
-                segment.segment_id,
+                job.segment.segment_id,
                 TranscriptStabilizer(TRANSCRIPT_CONFIRM_UPDATES),
             )
-            update = stabilizer.update(text, is_final=segment.is_final)
+            update = stabilizer.update(text, is_final=job.is_final)
             scene_text = ""
             if update.text:
-                scene_text = self.scene_memory.update(
-                    segment.segment_id,
-                    update.text,
-                    is_final=update.is_final,
-                )
+                with self.scene_lock:
+                    scene_text = self.scene_memory.update(
+                        job.segment.segment_id,
+                        update.text,
+                        is_final=update.is_final,
+                    )
             if scene_text and (update.changed or update.is_final):
                 self.emit_transcript(
                     scene_text,
@@ -554,29 +603,105 @@ class RealTimePipeline:
                     is_final=update.is_final,
                 )
 
-            if segment.is_final:
-                self.stabilizers.pop(segment.segment_id, None)
-                if completed:
-                    self.completed_segments.task_done()
+            self.cleanup_final_job(job)
+            self.send_runtime_status(force=True)
+
+    def request_interval_ready(self, now):
+        if now < self.backend_retry_not_before:
+            return False
+        if self.backend in {"groq", "groq_hybrid", "google"}:
+            return now - self.last_online_request_time >= self.online_request_interval()
+        return now - self.last_whisper_request_time >= self.local_request_interval()
+
+    def mark_request_started(self, now):
+        if self.backend in {"groq", "groq_hybrid", "google"}:
+            self.last_online_request_time = now
+        else:
+            self.last_whisper_request_time = now
+
+    def handle_retryable_failure(self, job, exc):
+        now = time.monotonic()
+        retry_delay = exc.retry_after
+        if retry_delay is None:
+            retry_delay = exponential_backoff(
+                job.attempts,
+                base_seconds=TRANSCRIPTION_RETRY_BASE_SECONDS,
+                max_seconds=TRANSCRIPTION_RETRY_MAX_SECONDS,
+            )
+        self.backend_retry_not_before = max(
+            self.backend_retry_not_before,
+            now + retry_delay,
+        )
+
+        should_retry = job.is_final and job.attempts < TRANSCRIPTION_FINAL_MAX_RETRIES
+        if should_retry and self.scheduler.retry_final(job, now, retry_delay):
+            self.backend_status = "retrying"
+            print(
+                f"\n[TRANSCRIPTION RETRY]: Final segment {job.segment.segment_id} "
+                f"in {retry_delay:.1f}s ({job.attempts + 1}/{TRANSCRIPTION_FINAL_MAX_RETRIES})."
+            )
+        else:
+            self.scheduler.mark_failed()
+            self.backend_status = "error"
+            self.cleanup_final_job(job)
+            print(f"\n[TRANSCRIPTION ERROR]: {exc}")
+        self.send_runtime_status(force=True)
+
+    def cleanup_final_job(self, job):
+        if job.is_final:
+            self.stabilizers.pop(job.segment.segment_id, None)
+
+    def send_osc_message(self, address, value):
+        if self.osc_client is None:
+            return
+        with self.osc_lock:
+            self.osc_client.send_message(address, value)
+
+    def send_runtime_status(self, force=False):
+        if self.osc_client is None:
+            return
+        now = time.monotonic()
+        with self.osc_lock:
+            if not force and now - self.last_status_osc_time < OSC_STATUS_INTERVAL:
+                return
+            metrics = self.scheduler.metrics(now)
+            self.osc_client.send_message("/backend_status", self.backend_status)
+            self.osc_client.send_message("/backend", self.backend)
+            self.osc_client.send_message("/is_speaking", int(self.is_speaking))
+            self.osc_client.send_message("/queue_depth", metrics.queue_depth)
+            self.osc_client.send_message("/latency_total", float(self.last_total_latency))
+            self.osc_client.send_message("/latency_asr", float(self.last_inference_latency))
+            self.osc_client.send_message(
+                "/retry_in",
+                float(max(0.0, self.backend_retry_not_before - now)),
+            )
+            self.osc_client.send_message(
+                "/dropped_jobs",
+                metrics.dropped_stale + metrics.dropped_finals,
+            )
+            self.last_status_osc_time = now
+
+    def selected_language(self):
+        with self.state_lock:
+            return self.current_language
 
     def emit_transcript(self, text, raw_text=None, is_final=False):
         if not text:
             return
         raw_text = raw_text or text
         if text == self.last_text:
-            if is_final and self.osc_client is not None:
-                self.osc_client.send_message("/transcript_final", raw_text)
+            if is_final:
+                self.send_osc_message("/transcript_final", raw_text)
             return
         self.last_text = text
         final_prompt = self.build_visual_prompt(text)
 
-        if self.osc_client is not None:
-            self.osc_client.send_message("/prompt", final_prompt)
-            self.osc_client.send_message("/partial_text", raw_text)
-            self.osc_client.send_message("/scene_context", text)
-            self.osc_client.send_message("/prompt_tokens", self.last_prompt_token_count)
-            if is_final:
-                self.osc_client.send_message("/transcript_final", raw_text)
+        self.send_osc_message("/prompt", final_prompt)
+        self.send_osc_message("/partial_text", raw_text)
+        self.send_osc_message("/scene_context", text)
+        self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
+        if is_final:
+            self.send_osc_message("/transcript_final", raw_text)
 
         state = "FINAL" if is_final else "STABLE"
         print(f"\n[PROMPT {state}]: {text}")
@@ -584,9 +709,15 @@ class RealTimePipeline:
             print(f"[CURRENT TRANSCRIPT]: {raw_text}")
 
     def build_visual_prompt(self, text):
-        visual_mode = VISUAL_MODES.get(self.current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
+        with self.state_lock:
+            current_visual_mode = self.current_visual_mode
+            current_prompt_style = self.current_prompt_style
+            current_gender = self.current_gender
+            current_age = self.current_age
 
-        if self.current_prompt_style == "general_scene":
+        visual_mode = VISUAL_MODES.get(current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
+
+        if current_prompt_style == "general_scene":
             variants = [
                 (
                     "full",
@@ -611,8 +742,8 @@ class RealTimePipeline:
                 ),
             ]
         else:
-            gender_focus = GENDER_MODES.get(self.current_gender, "person")
-            age_desc = AGE_MODES.get(self.current_age, "")
+            gender_focus = GENDER_MODES.get(current_gender, "person")
+            age_desc = AGE_MODES.get(current_age, "")
             subject_focus = f"{visual_mode['subject_prefix']} {gender_focus}"
             variants = [
                 (
@@ -704,7 +835,7 @@ class RealTimePipeline:
             full_audio,
             fp16=DEVICE.startswith("cuda"),
             task="translate",
-            language=self.current_language,
+            language=self.selected_language(),
             beam_size=WHISPER_BEAM_SIZE,
             best_of=WHISPER_BEST_OF,
             temperature=WHISPER_TEMPERATURE,
@@ -725,7 +856,7 @@ class RealTimePipeline:
         segments, _ = self.model.transcribe(
             full_audio,
             task="translate",
-            language=self.current_language,
+            language=self.selected_language(),
             beam_size=WHISPER_BEAM_SIZE,
             best_of=WHISPER_BEST_OF,
             temperature=WHISPER_TEMPERATURE,
@@ -738,6 +869,19 @@ class RealTimePipeline:
         if WHISPER_LOG_LATENCY:
             print(f"\n[FASTER-WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
         return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+
+    @staticmethod
+    def raise_for_retryable_http_response(response, operation):
+        if response.status_code == 429:
+            raise RetryableTranscriptionError(
+                f"{operation} was rate-limited by Groq (HTTP 429)",
+                retry_after=retry_after_seconds(response.headers),
+            )
+        if response.status_code in {408, 409, 425} or response.status_code >= 500:
+            raise RetryableTranscriptionError(
+                f"{operation} is temporarily unavailable (HTTP {response.status_code})",
+                retry_after=retry_after_seconds(response.headers),
+            )
 
     def transcribe_groq(self, audio_samples):
         wav_bytes = self.encode_wav(audio_samples)
@@ -763,26 +907,26 @@ class RealTimePipeline:
             elapsed = time.perf_counter() - started
             if GROQ_LOG_LATENCY:
                 print(f"\n[GROQ LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-            if response.status_code == 429:
-                print("\n[GROQ TRANSCRIPTION RATE LIMIT]: Slow down or wait for the free quota to reset.")
-                return ""
+            self.raise_for_retryable_http_response(response, "Groq transcription")
             if response.status_code >= 400:
                 if response.status_code == 400 and "does not support `translate`" in response.text:
-                    print(
-                        "\n[GROQ TRANSCRIPTION ERROR]: Groq audio translation requires "
-                        "GROQ_TRANSCRIPTION_MODEL=whisper-large-v3."
+                    raise RuntimeError(
+                        "Groq audio translation requires "
+                        "GROQ_TRANSCRIPTION_MODEL=whisper-large-v3"
                     )
-                    return ""
-                print(f"\n[GROQ TRANSCRIPTION ERROR]: HTTP {response.status_code} {response.text[:160]}")
-                return ""
+                raise RuntimeError(
+                    f"Groq transcription rejected the request (HTTP {response.status_code}): "
+                    f"{response.text[:160]}"
+                )
             if GROQ_RESPONSE_FORMAT == "text":
                 text = response.text.strip()
             else:
                 text = response.json().get("text", "").strip()
             return self.ensure_english_prompt_text(text)
-        except requests.RequestException as e:
-            print(f"\n[GROQ TRANSCRIPTION ERROR]: {e}")
-            return ""
+        except requests.RequestException as exc:
+            raise RetryableTranscriptionError(
+                f"Groq transcription request failed: {exc}"
+            ) from exc
 
     def transcribe_groq_hybrid(self, audio_samples):
         wav_bytes = self.encode_wav(audio_samples)
@@ -793,8 +937,9 @@ class RealTimePipeline:
             "response_format": GROQ_RESPONSE_FORMAT,
             "temperature": "0",
         }
-        if self.current_language:
-            data["language"] = self.current_language
+        language = self.selected_language()
+        if language:
+            data["language"] = language
 
         try:
             started = time.perf_counter()
@@ -808,20 +953,21 @@ class RealTimePipeline:
             elapsed = time.perf_counter() - started
             if GROQ_LOG_LATENCY:
                 print(f"\n[GROQ HYBRID LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-            if response.status_code == 429:
-                print("\n[GROQ HYBRID RATE LIMIT]: Slow down or wait for the free quota to reset.")
-                return ""
+            self.raise_for_retryable_http_response(response, "Groq hybrid transcription")
             if response.status_code >= 400:
-                print(f"\n[GROQ HYBRID ERROR]: HTTP {response.status_code} {response.text[:160]}")
-                return ""
+                raise RuntimeError(
+                    f"Groq hybrid transcription rejected the request (HTTP {response.status_code}): "
+                    f"{response.text[:160]}"
+                )
             if GROQ_RESPONSE_FORMAT == "text":
                 text = response.text.strip()
             else:
                 text = response.json().get("text", "").strip()
             return self.ensure_local_english_prompt_text(text)
-        except requests.RequestException as e:
-            print(f"\n[GROQ HYBRID ERROR]: {e}")
-            return ""
+        except requests.RequestException as exc:
+            raise RetryableTranscriptionError(
+                f"Groq hybrid transcription request failed: {exc}"
+            ) from exc
 
     def ensure_english_prompt_text(self, text):
         if not text:
@@ -869,6 +1015,7 @@ class RealTimePipeline:
                 timeout=GROQ_REQUEST_TIMEOUT,
             )
             elapsed = time.perf_counter() - started
+            self.raise_for_retryable_http_response(response, "Groq text translation")
             if response.status_code >= 400:
                 print(f"\n[GROQ TEXT TRANSLATION ERROR]: HTTP {response.status_code} {response.text[:160]}")
                 return ""
@@ -876,9 +1023,10 @@ class RealTimePipeline:
             if GROQ_LOG_LATENCY:
                 print(f"\n[GROQ TEXT TRANSLATION]: {elapsed:.2f}s")
             return translation
-        except requests.RequestException as e:
-            print(f"\n[GROQ TEXT TRANSLATION ERROR]: {e}")
-            return ""
+        except requests.RequestException as exc:
+            raise RetryableTranscriptionError(
+                f"Groq text translation request failed: {exc}"
+            ) from exc
 
     def initialize_local_translator(self):
         if LOCAL_TRANSLATOR != "argos":
@@ -916,8 +1064,9 @@ class RealTimePipeline:
         return translated or text
 
     def detect_text_language(self, text):
-        if self.current_language:
-            return self.normalize_language_code(self.current_language)
+        language = self.selected_language()
+        if language:
+            return self.normalize_language_code(language)
         if self.contains_cjk(text):
             return "zh"
         if detect_language is not None and len(text.strip()) >= 8:
@@ -1033,12 +1182,12 @@ class RealTimePipeline:
         except sr.UnknownValueError:
             return ""
         except sr.RequestError as e:
-            print(f"\n[ONLINE TRANSCRIPTION ERROR]: {e}")
-            return ""
+            raise RetryableTranscriptionError(f"Google transcription request failed: {e}") from e
 
     def google_language(self):
-        if self.current_language:
-            return GOOGLE_LANGUAGE_MAP.get(self.current_language, self.current_language)
+        language = self.selected_language()
+        if language:
+            return GOOGLE_LANGUAGE_MAP.get(language, language)
         return GOOGLE_SPEECH_LANGUAGE
 
     def benchmark(self, wav_path, runs=3):
@@ -1095,7 +1244,68 @@ class RealTimePipeline:
             raise ValueError("Benchmark WAV contains no audio samples.")
         return samples
 
+    def start_osc_control_server(self):
+        if not self.osc_control_enabled:
+            return
+        server = OscControlServer(
+            OSC_CONTROL_IP,
+            OSC_CONTROL_PORT,
+            self.apply_control,
+        )
+        try:
+            address = server.start()
+        except OSError as exc:
+            print(f"[OSC CONTROL]: Could not bind {OSC_CONTROL_IP}:{OSC_CONTROL_PORT} ({exc}).")
+            return
+        self.osc_control_server = server
+        print(f"[OSC CONTROL]: Listening on {address[0]}:{address[1]}.")
+
+    def apply_control(self, control_name, value):
+        if control_name == "request_status":
+            self.send_runtime_status(force=True)
+            return
+        if control_name == "reset_scene":
+            with self.scene_lock:
+                self.scene_memory.reset()
+                self.last_text = ""
+            self.send_osc_message("/scene_context", "")
+            self.send_osc_message("/scene_reset", 1)
+            print("\n[MODE]: SCENE MEMORY -> RESET")
+            return
+
+        valid_values = {
+            "gender": GENDER_MODES,
+            "age": AGE_MODES,
+            "visual_mode": VISUAL_MODES,
+            "prompt_style": PROMPT_STYLES,
+            "language": {None: None, "en": "ENGLISH", "zh": "CHINESE", "es": "SPANISH"},
+        }
+        if control_name not in valid_values or value not in valid_values[control_name]:
+            raise ValueError(f"Invalid {control_name} control value: {value}")
+
+        with self.state_lock:
+            if control_name == "gender":
+                self.current_gender = value
+                label = value.upper()
+            elif control_name == "age":
+                self.current_age = value
+                label = value.upper()
+            elif control_name == "visual_mode":
+                self.current_visual_mode = value
+                label = VISUAL_MODES[value]["label"]
+            elif control_name == "prompt_style":
+                self.current_prompt_style = value
+                label = PROMPT_STYLES[value]["label"]
+            else:
+                self.current_language = value
+                label = "AUTO-DETECT" if value is None else valid_values["language"][value]
+
+        print(f"\n[MODE]: {control_name.upper()} -> {label}")
+        acknowledgement = "auto" if value is None else str(value)
+        self.send_osc_message("/control_ack", f"{control_name}:{acknowledgement}")
+
     def start(self):
+        self.start_osc_control_server()
         t1 = threading.Thread(target=self.audio_callback, daemon=True)
         t2 = threading.Thread(target=self.transcription_loop, daemon=True)
         
@@ -1111,74 +1321,59 @@ class RealTimePipeline:
             print("  [VISUAL] 'd' -> Asian American | 'b' -> Black and Brown people | 'x' -> Asian + Black and Brown")
             print("  [PROMPT] 'f' -> Human figure focus | 'g' -> General scene")
             print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
+            if self.osc_control_server is not None:
+                print(f"  [OSC IN] {OSC_CONTROL_IP}:{OSC_CONTROL_PORT} for TouchDesigner controls")
             if self.backend == "groq":
                 print("  [ONLINE] Groq translates detected speech to English automatically")
             if self.backend == "google":
                 print(f"  [ONLINE] Auto/default language -> {GOOGLE_SPEECH_LANGUAGE}")
             print("  Ctrl+C   -> Exit")
             print("="*50 + "\n")
+            self.send_runtime_status(force=True)
             
-            while True:
+            while self.is_running:
                 if msvcrt.kbhit():
-                    key = msvcrt.getch().decode('utf-8').lower()
-                    if key == 'm':
-                        self.current_gender = "man"
-                        print(f"\n[MODE]: GENDER -> MAN")
-                    elif key == 'w':
-                        self.current_gender = "woman"
-                        print(f"\n[MODE]: GENDER -> WOMAN")
-                    elif key == 'n':
-                        self.current_gender = "neutral"
-                        print(f"\n[MODE]: GENDER -> NEUTRAL")
-                    elif key == '1':
-                        self.current_age = "young"
-                        print(f"\n[MODE]: AGE -> YOUNG")
-                    elif key == '2':
-                        self.current_age = "adult"
-                        print(f"\n[MODE]: AGE -> ADULT")
-                    elif key == '3':
-                        self.current_age = "elder"
-                        print(f"\n[MODE]: AGE -> ELDER")
-                    elif key == 'd':
-                        self.current_visual_mode = "asian_american"
-                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
-                    elif key == 'b':
-                        self.current_visual_mode = "black_brown"
-                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
-                    elif key == 'x':
-                        self.current_visual_mode = "asian_black_brown"
-                        print(f"\n[MODE]: VISUAL -> {VISUAL_MODES[self.current_visual_mode]['label']}")
-                    elif key == 'f':
-                        self.current_prompt_style = "human_focus"
-                        print(f"\n[MODE]: PROMPT -> {PROMPT_STYLES[self.current_prompt_style]['label']}")
-                    elif key == 'g':
-                        self.current_prompt_style = "general_scene"
-                        print(f"\n[MODE]: PROMPT -> {PROMPT_STYLES[self.current_prompt_style]['label']}")
-                    elif key == 'e':
-                        self.current_language = "en"
-                        print(f"\n[MODE]: LANG -> ENGLISH")
-                    elif key == 'c':
-                        self.current_language = "zh"
-                        print(f"\n[MODE]: LANG -> CHINESE")
-                    elif key == 's':
-                        self.current_language = "es"
-                        print(f"\n[MODE]: LANG -> SPANISH")
-                    elif key == 'a':
-                        self.current_language = None
-                        print(f"\n[MODE]: LANG -> AUTO-DETECT")
+                    try:
+                        key = msvcrt.getch().decode("utf-8").lower()
+                    except UnicodeDecodeError:
+                        continue
+                    control = KEYBOARD_CONTROLS.get(key)
+                    if control is not None:
+                        self.apply_control(*control)
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
             self.is_running = False
+            self.backend_status = "stopped"
+            self.is_speaking = False
+            self.send_runtime_status(force=True)
             t1.join(timeout=2.0)
             t2.join(timeout=2.0)
+            if self.osc_control_server is not None:
+                self.osc_control_server.stop()
 
 if __name__ == "__main__":
+    if ARGS.diagnose:
+        raise SystemExit(
+            run_diagnostics(
+                backend=TRANSCRIPTION_BACKEND,
+                model_size=MODEL_SIZE,
+                device=DEVICE,
+                sample_rate=RATE,
+                chunk_size=CHUNK,
+                osc_control_ip=OSC_CONTROL_IP,
+                osc_control_port=OSC_CONTROL_PORT,
+                groq_key_configured=bool(GROQ_API_KEY),
+                capriole_key_configured=bool(os.environ.get("CAPRIOLE_API_KEY")),
+            )
+        )
+
     pipeline = RealTimePipeline(
         enable_vad=not bool(ARGS.benchmark),
         enable_osc=not bool(ARGS.benchmark),
         enable_prompt_budget=not bool(ARGS.benchmark),
+        enable_osc_controls=not bool(ARGS.benchmark),
     )
     if ARGS.benchmark:
         pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
