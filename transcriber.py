@@ -17,6 +17,7 @@ from osc_control import OscControlServer
 from prompt_engine import PromptBudgeter, RollingSceneMemory
 from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
+from transcript_filter import is_probable_whisper_hallucination
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -68,7 +69,7 @@ def env_int(name, default):
         return default
 
 
-def parse_args():
+def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Live speech-to-visual prompt bridge for StreamDiffusionTD.")
     parser.add_argument(
         "-b",
@@ -92,11 +93,11 @@ def parse_args():
         action="store_true",
         help="Check the GPU, microphone, packages, OSC port, model cache, and credential hygiene."
     )
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 load_env_file()
-ARGS = parse_args()
+ARGS = parse_args() if __name__ == "__main__" else parse_args([])
 
 # --- Configuration ---
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
@@ -316,6 +317,23 @@ VAD_PRE_ROLL_SECONDS = env_float("VAD_PRE_ROLL_SECONDS", 0.32)
 VAD_SILENCE_SECONDS = env_float("VAD_SILENCE_SECONDS", 0.7)
 STREAM_OVERLAP_SECONDS = env_float("STREAM_OVERLAP_SECONDS", 0.5)
 TRANSCRIPT_CONFIRM_UPDATES = max(1, env_int("TRANSCRIPT_CONFIRM_UPDATES", 2))
+AUDIO_RECONNECT_ENABLED = env_bool("AUDIO_RECONNECT_ENABLED", True)
+AUDIO_RECONNECT_BASE_SECONDS = max(
+    0.1,
+    env_float("AUDIO_RECONNECT_BASE_SECONDS", 0.5),
+)
+AUDIO_RECONNECT_MAX_SECONDS = max(
+    AUDIO_RECONNECT_BASE_SECONDS,
+    env_float("AUDIO_RECONNECT_MAX_SECONDS", 8.0),
+)
+AUDIO_MAX_CONSECUTIVE_READ_ERRORS = max(
+    1,
+    env_int("AUDIO_MAX_CONSECUTIVE_READ_ERRORS", 3),
+)
+AUDIO_READ_RETRY_SECONDS = max(
+    0.0,
+    env_float("AUDIO_READ_RETRY_SECONDS", 0.1),
+)
 
 
 class RealTimePipeline:
@@ -436,6 +454,9 @@ class RealTimePipeline:
         self.last_text = ""
         self.is_running = True
         self.is_speaking = False
+        self.audio_status = "starting"
+        self.audio_reconnects = 0
+        self.last_audio_error = ""
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
@@ -485,56 +506,173 @@ class RealTimePipeline:
         print(f"Using energy VAD (threshold {VAD_ENERGY_THRESHOLD:.0f}).")
         return EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
 
-    def audio_callback(self):
-        p = pyaudio.PyAudio()
-        stream = None
+    def create_audio_interface(self):
+        return pyaudio.PyAudio()
+
+    def open_microphone_stream(self, audio_interface):
+        return audio_interface.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK,
+        )
+
+    def process_audio_data(self, data):
+        audio_data = np.frombuffer(data, dtype=np.int16)
         try:
-            stream = p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-            )
-            print("\n>>> Active. Visuals will update when you speak.")
+            is_speech = self.vad.is_speech(audio_data)
+        except Exception as exc:
+            print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
+            self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+            is_speech = self.vad.is_speech(audio_data)
 
-            while self.is_running:
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                    audio_data = np.frombuffer(data, dtype=np.int16)
+        with self.lock:
+            completed = self.segmenter.add_chunk(audio_data, is_speech)
+            speaking = self.segmenter.active
+
+        if speaking != self.is_speaking:
+            self.is_speaking = speaking
+            self.send_runtime_status(force=True)
+
+        now = time.monotonic()
+        for segment in completed:
+            if self.scheduler.submit_final(segment, now) is None:
+                print("\n[SCHEDULER]: Final queue is full; newest final segment was dropped.")
+        self.send_runtime_status()
+
+    def wait_for_audio_retry(self, delay_seconds):
+        deadline = time.monotonic() + max(0.0, delay_seconds)
+        while self.is_running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.1, remaining))
+        return False
+
+    @staticmethod
+    def close_audio_session(stream, audio_interface):
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if audio_interface is not None:
+            try:
+                audio_interface.terminate()
+            except Exception:
+                pass
+
+    def finalize_interrupted_audio(self):
+        with self.lock:
+            segment = self.segmenter.interrupt()
+        if segment is None or segment.samples.size == 0:
+            return
+        if self.scheduler.submit_final(segment, time.monotonic()) is None:
+            print("\n[SCHEDULER]: Final queue is full; interrupted audio was dropped.")
+
+    def audio_callback(self):
+        reconnect_attempt = 0
+
+        while self.is_running:
+            audio_interface = None
+            stream = None
+            failure = None
+            try:
+                audio_interface = self.create_audio_interface()
+                stream = self.open_microphone_stream(audio_interface)
+
+                if self.audio_reconnects:
+                    print("\n[AUDIO RECOVERED]: Microphone stream is available again.")
+                else:
+                    print("\n>>> Active. Visuals will update when you speak.")
+                self.audio_status = "ready"
+                self.last_audio_error = ""
+                self.send_runtime_status(force=True)
+
+                consecutive_read_errors = 0
+                while self.is_running:
                     try:
-                        is_speech = self.vad.is_speech(audio_data)
+                        data = stream.read(CHUNK, exception_on_overflow=False)
                     except Exception as exc:
-                        print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
-                        self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
-                        is_speech = self.vad.is_speech(audio_data)
-
-                    with self.lock:
-                        completed = self.segmenter.add_chunk(audio_data, is_speech)
-                        speaking = self.segmenter.active
-
-                    if speaking != self.is_speaking:
-                        self.is_speaking = speaking
+                        consecutive_read_errors += 1
+                        self.audio_status = "degraded"
+                        self.last_audio_error = self.clean_audio_error(exc)
+                        self.is_speaking = False
                         self.send_runtime_status(force=True)
 
-                    now = time.monotonic()
-                    for segment in completed:
-                        if self.scheduler.submit_final(segment, now) is None:
-                            print("\n[SCHEDULER]: Final queue is full; newest final segment was dropped.")
-                    self.send_runtime_status()
-                except Exception as exc:
-                    print(f"\n[AUDIO ERROR]: {exc}")
-                    time.sleep(0.1)
-        except Exception as exc:
-            self.backend_status = "error"
-            self.is_running = False
-            print(f"\n[AUDIO STARTUP ERROR]: {exc}")
-            self.send_runtime_status(force=True)
-        finally:
+                        if consecutive_read_errors >= AUDIO_MAX_CONSECUTIVE_READ_ERRORS:
+                            raise RuntimeError(
+                                f"microphone read failed {consecutive_read_errors} consecutive times: {exc}"
+                            ) from exc
+
+                        print(
+                            f"\n[AUDIO READ ERROR]: {exc} "
+                            f"({consecutive_read_errors}/{AUDIO_MAX_CONSECUTIVE_READ_ERRORS}); "
+                            "retrying the current stream."
+                        )
+                        if not self.wait_for_audio_retry(AUDIO_READ_RETRY_SECONDS):
+                            break
+                        continue
+
+                    if consecutive_read_errors:
+                        print("\n[AUDIO RECOVERED]: Microphone reads resumed.")
+                        self.audio_status = "ready"
+                        self.last_audio_error = ""
+                        self.send_runtime_status(force=True)
+                    consecutive_read_errors = 0
+                    reconnect_attempt = 0
+                    try:
+                        self.process_audio_data(data)
+                    except Exception as exc:
+                        print(f"\n[AUDIO PROCESSING ERROR]: {exc}")
+            except Exception as exc:
+                failure = exc
+            finally:
+                self.close_audio_session(stream, audio_interface)
+
+            if failure is None or not self.is_running:
+                break
+
             if stream is not None:
-                stream.stop_stream()
-                stream.close()
-            p.terminate()
+                self.finalize_interrupted_audio()
+            self.is_speaking = False
+            self.last_audio_error = self.clean_audio_error(failure)
+            if not AUDIO_RECONNECT_ENABLED:
+                self.audio_status = "error"
+                self.is_running = False
+                print(f"\n[AUDIO ERROR]: {failure}. Automatic reconnection is disabled.")
+                self.send_runtime_status(force=True)
+                break
+
+            retry_delay = exponential_backoff(
+                reconnect_attempt,
+                base_seconds=AUDIO_RECONNECT_BASE_SECONDS,
+                max_seconds=AUDIO_RECONNECT_MAX_SECONDS,
+            )
+            reconnect_attempt += 1
+            self.audio_reconnects += 1
+            self.audio_status = "reconnecting"
+            print(
+                f"\n[AUDIO RECONNECT]: {failure}. "
+                f"Retrying in {retry_delay:.1f}s (attempt {self.audio_reconnects})."
+            )
+            self.send_runtime_status(force=True)
+            if not self.wait_for_audio_retry(retry_delay):
+                break
+
+        if self.audio_status != "error":
+            self.audio_status = "stopped"
+            self.is_speaking = False
+            self.send_runtime_status(force=True)
+
+    @staticmethod
+    def clean_audio_error(error):
+        return " ".join(str(error).split())[:240]
 
     def transcription_loop(self):
         while self.is_running:
@@ -579,8 +717,7 @@ class RealTimePipeline:
             self.backend_status = "ready"
             self.backend_retry_not_before = 0.0
 
-            hallucinations = ["Thanks for watching", "Thank you", "Subtitle", "Subscribe"]
-            if any(h.lower() in text.lower() for h in hallucinations):
+            if is_probable_whisper_hallucination(text):
                 text = ""
 
             stabilizer = self.stabilizers.setdefault(
@@ -661,6 +798,12 @@ class RealTimePipeline:
         if self.osc_client is None:
             return
         now = time.monotonic()
+        with self.state_lock:
+            current_gender = self.current_gender
+            current_age = self.current_age
+            current_visual_mode = self.current_visual_mode
+            current_prompt_style = self.current_prompt_style
+            current_language = self.current_language or "auto"
         with self.osc_lock:
             if not force and now - self.last_status_osc_time < OSC_STATUS_INTERVAL:
                 return
@@ -679,6 +822,14 @@ class RealTimePipeline:
                 "/dropped_jobs",
                 metrics.dropped_stale + metrics.dropped_finals,
             )
+            self.osc_client.send_message("/audio_status", self.audio_status)
+            self.osc_client.send_message("/audio_reconnects", self.audio_reconnects)
+            self.osc_client.send_message("/audio_error", self.last_audio_error)
+            self.osc_client.send_message("/gender", current_gender)
+            self.osc_client.send_message("/age", current_age)
+            self.osc_client.send_message("/visual_mode", current_visual_mode)
+            self.osc_client.send_message("/prompt_style", current_prompt_style)
+            self.osc_client.send_message("/language", current_language)
             self.last_status_osc_time = now
 
     def selected_language(self):
@@ -689,11 +840,14 @@ class RealTimePipeline:
         if not text:
             return
         raw_text = raw_text or text
-        if text == self.last_text:
+        with self.scene_lock:
+            unchanged = text == self.last_text
+            if not unchanged:
+                self.last_text = text
+        if unchanged:
             if is_final:
                 self.send_osc_message("/transcript_final", raw_text)
             return
-        self.last_text = text
         final_prompt = self.build_visual_prompt(text)
 
         self.send_osc_message("/prompt", final_prompt)
@@ -707,6 +861,18 @@ class RealTimePipeline:
         print(f"\n[PROMPT {state}]: {text}")
         if raw_text != text:
             print(f"[CURRENT TRANSCRIPT]: {raw_text}")
+
+    def refresh_visual_prompt(self):
+        with self.scene_lock:
+            text = self.last_text
+        if not text:
+            return False
+
+        final_prompt = self.build_visual_prompt(text)
+        self.send_osc_message("/prompt", final_prompt)
+        self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
+        print(f"\n[PROMPT REFRESH]: Applied the current visual controls to: {text}")
+        return True
 
     def build_visual_prompt(self, text):
         with self.state_lock:
@@ -1303,6 +1469,9 @@ class RealTimePipeline:
         print(f"\n[MODE]: {control_name.upper()} -> {label}")
         acknowledgement = "auto" if value is None else str(value)
         self.send_osc_message("/control_ack", f"{control_name}:{acknowledgement}")
+        if control_name in {"gender", "age", "visual_mode", "prompt_style"}:
+            self.refresh_visual_prompt()
+        self.send_runtime_status(force=True)
 
     def start(self):
         self.start_osc_control_server()

@@ -63,6 +63,27 @@ class AudioSegmenterTests(unittest.TestCase):
         np.testing.assert_array_equal(overlap_snapshot.samples, np.array([3, 3], dtype=np.int16))
         self.assertNotEqual(completed[0].segment_id, overlap_snapshot.segment_id)
 
+    def test_input_interruption_finalizes_active_audio_and_clears_pre_roll(self):
+        segmenter = self.make_segmenter(pre_roll_seconds=0.4)
+        segmenter.add_chunk(np.array([1, 1], dtype=np.int16), False)
+        segmenter.add_chunk(np.array([2, 2], dtype=np.int16), True)
+
+        interrupted = segmenter.interrupt()
+
+        self.assertTrue(interrupted.is_final)
+        np.testing.assert_array_equal(
+            interrupted.samples,
+            np.array([1, 1, 2, 2], dtype=np.int16),
+        )
+        self.assertFalse(segmenter.active)
+        self.assertIsNone(segmenter.snapshot())
+
+        segmenter.add_chunk(np.array([3, 3], dtype=np.int16), True)
+        np.testing.assert_array_equal(
+            segmenter.snapshot().samples,
+            np.array([3, 3], dtype=np.int16),
+        )
+
 
 class TranscriptStabilizerTests(unittest.TestCase):
     def test_confirms_shared_prefix_across_two_updates(self):

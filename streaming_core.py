@@ -108,6 +108,14 @@ class AudioSegmenter:
             return None
         return self._snapshot(is_final=False)
 
+    def interrupt(self):
+        """Finalize active speech and clear device-specific pre-roll after an input outage."""
+
+        completed = self._snapshot(is_final=True) if self._active else None
+        self._reset_active()
+        self._pre_roll.clear()
+        return completed
+
     def _snapshot(self, is_final):
         if not self._active_chunks:
             return AudioSegment(

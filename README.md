@@ -6,12 +6,14 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 - **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals, Black and Brown people visuals, or combined Asian + Black and Brown visuals.
 - **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
-- **Live Gender, Age & Visual Identity Selection**: Interactive keyboard controls to toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode in real-time.
+- **Live Gender, Age & Visual Identity Selection**: Interactive keyboard and OSC controls toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode. Visual changes immediately rebuild the active prompt without waiting for more speech.
 - **Stable Streaming Transcription**: Confirms the word prefix shared by consecutive hypotheses, reducing repeated text and prompt flicker.
+- **Conservative Hallucination Filtering**: Removes standalone Whisper outro artifacts such as “thanks for watching” without discarding real sentences that merely contain similar words.
 - **Rolling Scene Memory**: Removes overlap between audio segments and carries the newest subjects, places, and actions across prompt updates.
 - **Live Transcription**: Selectable audio-to-text using optimized local GPU **faster-whisper**, the original local GPU **OpenAI Whisper**, online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
+- **Automatic Microphone Recovery**: Brief read glitches retry in place, repeated failures safely finalize buffered speech, and disconnected or unavailable devices reopen with capped exponential backoff.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
@@ -135,6 +137,13 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     STREAM_OVERLAP_SECONDS=0.5
     TRANSCRIPT_CONFIRM_UPDATES=2
 
+    # Recover from microphone startup failures and live disconnections.
+    AUDIO_RECONNECT_ENABLED=true
+    AUDIO_RECONNECT_BASE_SECONDS=0.5
+    AUDIO_RECONNECT_MAX_SECONDS=8.0
+    AUDIO_MAX_CONSECUTIVE_READ_ERRORS=3
+    AUDIO_READ_RETRY_SECONDS=0.1
+
     # Bounded scheduler: finals have priority and obsolete partials are replaced.
     TRANSCRIPTION_MAX_FINAL_JOBS=8
     TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS=4.0
@@ -251,12 +260,21 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | `/prompt_tokens` | Maximum token count across both SDXL text encoders |
 | `/transcript_final` | Finalized transcript segment |
 | `/backend_status` | `ready`, `transcribing`, `retrying`, `error`, or `stopped` |
+| `/backend` | Active transcription backend |
 | `/is_speaking` | `1` while VAD detects an active speech segment, otherwise `0` |
 | `/queue_depth` | Pending final jobs plus the newest pending partial |
 | `/latency_total` | Seconds from scheduler submission through completed transcription |
 | `/latency_asr` | Seconds spent in the active ASR/translation call |
 | `/retry_in` | Seconds until a rate-limited or transiently unavailable backend may be called again |
 | `/dropped_jobs` | Total stale or capacity-dropped jobs |
+| `/audio_status` | `starting`, `ready`, `degraded`, `reconnecting`, `error`, or `stopped` |
+| `/audio_reconnects` | Total microphone reopen attempts during this run |
+| `/audio_error` | Most recent microphone error, cleared after recovery |
+| `/gender` | Active gender mode |
+| `/age` | Active age mode |
+| `/visual_mode` | Active visual identity mode |
+| `/prompt_style` | Active human-focus or general-scene mode |
+| `/language` | Active language code or `auto` |
 
 ### OSC Input from TouchDesigner
 
@@ -272,7 +290,7 @@ Send these messages to `127.0.0.1:7001`. Text values accept the names below or t
 | `/control/reset_scene` | Any value; clears rolling scene memory |
 | `/control/request_status` | Any value; immediately emits all runtime status addresses |
 
-Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`.
+Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes all five active mode addresses so a TouchDesigner interface can resynchronize after either process restarts.
 
 ## Runtime Structure
 
@@ -282,6 +300,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.
 - `diagnostics.py` owns the read-only startup health checks.
+- `transcript_filter.py` conservatively removes known standalone Whisper hallucinations.
 - `streaming_core.py` and `prompt_engine.py` own testable speech segmentation, transcript stability, scene memory, and prompt budgeting.
 
 ## Local Performance Benchmark
