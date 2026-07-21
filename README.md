@@ -317,8 +317,11 @@ The benchmark performs one warm-up pass, then reports latency and real-time fact
 Run the streaming logic tests without loading a Whisper model:
 
 ```powershell
+pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
+
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 
