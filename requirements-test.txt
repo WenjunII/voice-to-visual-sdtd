@@ -1,0 +1,4 @@
+# Lightweight dependencies for unit tests and CI. Hardware/model runtimes are mocked.
+numpy>=1.24,<1.25
+python-osc>=1.8,<2
+requests>=2.31,<3

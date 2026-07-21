@@ -188,6 +188,13 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         failing_stream.close.assert_called_once()
         recovered_stream.close.assert_called_once()
 
+    def test_missing_pyaudio_has_an_actionable_runtime_error(self):
+        pipeline = RealTimePipeline.__new__(RealTimePipeline)
+
+        with patch("transcriber.pyaudio", None):
+            with self.assertRaisesRegex(RuntimeError, "--diagnose"):
+                pipeline.create_audio_interface()
+
 
 if __name__ == "__main__":
     unittest.main()

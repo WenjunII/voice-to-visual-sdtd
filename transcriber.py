@@ -3,7 +3,6 @@ import io
 import wave
 import argparse
 import numpy as np
-import pyaudio
 import requests
 import threading
 import time
@@ -21,6 +20,11 @@ from transcript_filter import is_probable_whisper_hallucination
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 
 try:
     import speech_recognition as sr
@@ -307,7 +311,7 @@ KEYBOARD_CONTROLS = {
 
 # Audio recording constants
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
+FORMAT = pyaudio.paInt16 if pyaudio is not None else None
 CHANNELS = 1
 RATE = 16000
 VAD_ENGINE = os.environ.get("VAD_ENGINE", "silero").strip().lower()
@@ -507,6 +511,11 @@ class RealTimePipeline:
         return EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
 
     def create_audio_interface(self):
+        if pyaudio is None:
+            raise RuntimeError(
+                "PyAudio is not installed. Run 'python transcriber.py --diagnose' "
+                "for setup details, then install the project requirements."
+            )
         return pyaudio.PyAudio()
 
     def open_microphone_stream(self, audio_interface):
