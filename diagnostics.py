@@ -6,6 +6,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from audio_runtime import get_audio_input_device
+
 
 @dataclass(frozen=True)
 class DiagnosticResult:
@@ -24,12 +26,13 @@ def run_diagnostics(
     osc_control_port,
     groq_key_configured,
     capriole_key_configured,
+    audio_input_device_index=None,
 ):
     results = []
     results.append(_python_result())
     results.extend(_cuda_results(device, required=backend in {"whisper", "faster_whisper"}))
     results.extend(_package_results(backend))
-    results.append(_microphone_result(sample_rate, chunk_size))
+    results.append(_microphone_result(sample_rate, chunk_size, audio_input_device_index))
     results.append(_udp_bind_result(osc_control_ip, osc_control_port))
     results.append(_model_cache_result(model_size))
     results.append(_credential_result("Groq credential", groq_key_configured))
@@ -80,7 +83,8 @@ def _cuda_results(device, required):
             )
         return results
     except Exception as exc:
-        return [DiagnosticResult("PyTorch", "FAIL", str(exc))]
+        status = "FAIL" if required else "INFO"
+        return [DiagnosticResult("PyTorch", status, str(exc))]
 
 
 def _package_results(backend):
@@ -103,22 +107,27 @@ def _package_results(backend):
     return results
 
 
-def _microphone_result(sample_rate, chunk_size):
+def _microphone_result(sample_rate, chunk_size, input_device_index=None):
     audio = None
     stream = None
     try:
         import pyaudio
 
         audio = pyaudio.PyAudio()
-        device = audio.get_default_input_device_info()
+        device = get_audio_input_device(audio, input_device_index)
         stream = audio.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=sample_rate,
             input=True,
+            input_device_index=device.index,
             frames_per_buffer=chunk_size,
         )
-        return DiagnosticResult("Microphone", "PASS", str(device.get("name", "default input")))
+        return DiagnosticResult(
+            "Microphone",
+            "PASS",
+            f"[{device.index}] {device.name}",
+        )
     except Exception as exc:
         return DiagnosticResult("Microphone", "FAIL", str(exc))
     finally:

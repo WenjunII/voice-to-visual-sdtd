@@ -1,11 +1,23 @@
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from transcriber import RealTimePipeline
+from transcriber import RealTimePipeline, parse_args
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_accepts_an_audio_input_device_override(self):
+        args = parse_args(["--input-device", "4"])
+
+        self.assertEqual(args.input_device, 4)
+
+    def test_rejects_a_negative_audio_input_device(self):
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--input-device", "-1"])
 
 
 class RealTimePipelineControlTests(unittest.TestCase):
@@ -21,6 +33,8 @@ class RealTimePipelineControlTests(unittest.TestCase):
         pipeline.audio_status = "ready"
         pipeline.audio_reconnects = 0
         pipeline.last_audio_error = ""
+        pipeline.audio_device_index = 2
+        pipeline.audio_device_name = "USB Microphone"
         pipeline.state_lock = threading.Lock()
         pipeline.scene_lock = threading.Lock()
         pipeline.osc_lock = threading.Lock()
@@ -91,6 +105,8 @@ class RealTimePipelineControlTests(unittest.TestCase):
             ("/audio_status", "ready"),
             ("/audio_reconnects", 0),
             ("/audio_error", ""),
+            ("/audio_device_index", 2),
+            ("/audio_device_name", "USB Microphone"),
             ("/gender", "woman"),
             ("/age", "elder"),
             ("/visual_mode", "asian_black_brown"),
@@ -112,6 +128,8 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         pipeline.audio_status = "starting"
         pipeline.audio_reconnects = 0
         pipeline.last_audio_error = ""
+        pipeline.audio_device_index = -1
+        pipeline.audio_device_name = "system default"
         pipeline.send_runtime_status = Mock()
         pipeline.process_audio_data = Mock()
         pipeline.finalize_interrupted_audio = Mock()
@@ -194,6 +212,24 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         with patch("transcriber.pyaudio", None):
             with self.assertRaisesRegex(RuntimeError, "--diagnose"):
                 pipeline.create_audio_interface()
+
+    def test_opens_the_selected_input_device(self):
+        pipeline = RealTimePipeline.__new__(RealTimePipeline)
+        audio_interface = Mock()
+        selected = SimpleNamespace(index=4, name="Stage USB Microphone")
+
+        with (
+            patch("transcriber.AUDIO_INPUT_DEVICE_INDEX", 4),
+            patch("transcriber.get_audio_input_device", return_value=selected),
+        ):
+            pipeline.open_microphone_stream(audio_interface)
+
+        self.assertEqual(pipeline.audio_device_index, 4)
+        self.assertEqual(pipeline.audio_device_name, "Stage USB Microphone")
+        self.assertEqual(
+            audio_interface.open.call_args.kwargs["input_device_index"],
+            4,
+        )
 
 
 if __name__ == "__main__":

@@ -28,4 +28,12 @@ def retry_after_seconds(headers, default=None, now=None):
 
 
 def exponential_backoff(attempt, base_seconds=1.0, max_seconds=10.0):
-    return min(max_seconds, base_seconds * (2 ** max(0, attempt)))
+    if base_seconds < 0 or max_seconds < 0:
+        raise ValueError("backoff durations must be non-negative")
+
+    delay = min(max_seconds, base_seconds)
+    remaining = max(0, int(attempt))
+    while remaining and 0 < delay < max_seconds:
+        delay = min(max_seconds, delay * 2)
+        remaining -= 1
+    return delay
