@@ -9,7 +9,12 @@ import time
 from pythonosc import udp_client
 import msvcrt
 
-from audio_runtime import EnergyVoiceActivityDetector, SileroVoiceActivityDetector
+from audio_runtime import (
+    EnergyVoiceActivityDetector,
+    SileroVoiceActivityDetector,
+    get_audio_input_device,
+    list_audio_input_devices,
+)
 from backend_errors import RetryableTranscriptionError, exponential_backoff, retry_after_seconds
 from diagnostics import run_diagnostics
 from osc_control import OscControlServer
@@ -73,6 +78,29 @@ def env_int(name, default):
         return default
 
 
+def optional_non_negative_int(value):
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def env_optional_non_negative_int(name):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return optional_non_negative_int(value)
+    except argparse.ArgumentTypeError:
+        print(f"Invalid {name}='{value}'; using the system default input device.")
+        return None
+
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Live speech-to-visual prompt bridge for StreamDiffusionTD.")
     parser.add_argument(
@@ -80,6 +108,17 @@ def parse_args(args=None):
         "--backend",
         choices=["whisper", "faster_whisper", "groq", "groq_hybrid", "google"],
         help="Transcription backend. Overrides TRANSCRIPTION_BACKEND from .env for this run."
+    )
+    parser.add_argument(
+        "--input-device",
+        type=optional_non_negative_int,
+        metavar="INDEX",
+        help="PyAudio input-device index. Overrides AUDIO_INPUT_DEVICE_INDEX from .env."
+    )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List input-capable audio devices and exit."
     )
     parser.add_argument(
         "--benchmark",
@@ -314,6 +353,11 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16 if pyaudio is not None else None
 CHANNELS = 1
 RATE = 16000
+AUDIO_INPUT_DEVICE_INDEX = (
+    ARGS.input_device
+    if ARGS.input_device is not None
+    else env_optional_non_negative_int("AUDIO_INPUT_DEVICE_INDEX")
+)
 VAD_ENGINE = os.environ.get("VAD_ENGINE", "silero").strip().lower()
 VAD_THRESHOLD = env_float("VAD_THRESHOLD", 0.5)
 VAD_ENERGY_THRESHOLD = env_float("VAD_ENERGY_THRESHOLD", 400.0)
@@ -338,6 +382,39 @@ AUDIO_READ_RETRY_SECONDS = max(
     0.0,
     env_float("AUDIO_READ_RETRY_SECONDS", 0.1),
 )
+
+
+def print_audio_input_devices():
+    if pyaudio is None:
+        print("PyAudio is not installed; audio devices cannot be listed.")
+        return 1
+
+    audio_interface = None
+    try:
+        audio_interface = pyaudio.PyAudio()
+        devices = list_audio_input_devices(audio_interface)
+        if not devices:
+            print("No input-capable audio devices were found.")
+            return 1
+
+        print("\nINPUT AUDIO DEVICES")
+        print("=" * 72)
+        for device in devices:
+            marker = "*" if device.is_default else " "
+            rate = f"{device.default_sample_rate:.0f} Hz" if device.default_sample_rate else "unknown rate"
+            print(
+                f"{marker} [{device.index}] {device.name} "
+                f"({device.max_input_channels} input channel(s), {rate})"
+            )
+        print("=" * 72)
+        print("* system default")
+        return 0
+    except Exception as exc:
+        print(f"Could not enumerate audio devices: {exc}")
+        return 1
+    finally:
+        if audio_interface is not None:
+            audio_interface.terminate()
 
 
 class RealTimePipeline:
@@ -461,6 +538,8 @@ class RealTimePipeline:
         self.audio_status = "starting"
         self.audio_reconnects = 0
         self.last_audio_error = ""
+        self.audio_device_index = AUDIO_INPUT_DEVICE_INDEX if AUDIO_INPUT_DEVICE_INDEX is not None else -1
+        self.audio_device_name = "system default" if AUDIO_INPUT_DEVICE_INDEX is None else ""
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
@@ -519,11 +598,15 @@ class RealTimePipeline:
         return pyaudio.PyAudio()
 
     def open_microphone_stream(self, audio_interface):
+        device = get_audio_input_device(audio_interface, AUDIO_INPUT_DEVICE_INDEX)
+        self.audio_device_index = device.index
+        self.audio_device_name = device.name
         return audio_interface.open(
             format=FORMAT,
             channels=CHANNELS,
             rate=RATE,
             input=True,
+            input_device_index=device.index,
             frames_per_buffer=CHUNK,
         )
 
@@ -596,9 +679,15 @@ class RealTimePipeline:
                 stream = self.open_microphone_stream(audio_interface)
 
                 if self.audio_reconnects:
-                    print("\n[AUDIO RECOVERED]: Microphone stream is available again.")
+                    print(
+                        f"\n[AUDIO RECOVERED]: [{self.audio_device_index}] "
+                        f"{self.audio_device_name} is available again."
+                    )
                 else:
-                    print("\n>>> Active. Visuals will update when you speak.")
+                    print(
+                        f"\n>>> Active on [{self.audio_device_index}] {self.audio_device_name}. "
+                        "Visuals will update when you speak."
+                    )
                 self.audio_status = "ready"
                 self.last_audio_error = ""
                 self.send_runtime_status(force=True)
@@ -834,6 +923,8 @@ class RealTimePipeline:
             self.osc_client.send_message("/audio_status", self.audio_status)
             self.osc_client.send_message("/audio_reconnects", self.audio_reconnects)
             self.osc_client.send_message("/audio_error", self.last_audio_error)
+            self.osc_client.send_message("/audio_device_index", self.audio_device_index)
+            self.osc_client.send_message("/audio_device_name", self.audio_device_name)
             self.osc_client.send_message("/gender", current_gender)
             self.osc_client.send_message("/age", current_age)
             self.osc_client.send_message("/visual_mode", current_visual_mode)
@@ -1532,6 +1623,9 @@ class RealTimePipeline:
                 self.osc_control_server.stop()
 
 if __name__ == "__main__":
+    if ARGS.list_audio_devices:
+        raise SystemExit(print_audio_input_devices())
+
     if ARGS.diagnose:
         raise SystemExit(
             run_diagnostics(
@@ -1544,6 +1638,7 @@ if __name__ == "__main__":
                 osc_control_port=OSC_CONTROL_PORT,
                 groq_key_configured=bool(GROQ_API_KEY),
                 capriole_key_configured=bool(os.environ.get("CAPRIOLE_API_KEY")),
+                audio_input_device_index=AUDIO_INPUT_DEVICE_INDEX,
             )
         )
 

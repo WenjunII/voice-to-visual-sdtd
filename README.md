@@ -14,6 +14,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
 - **Automatic Microphone Recovery**: Brief read glitches retry in place, repeated failures safely finalize buffered speech, and disconnected or unavailable devices reopen with capped exponential backoff.
+- **Explicit Microphone Selection**: List available input devices and pin live capture and diagnostics to a specific PyAudio device index, or keep following the Windows system default.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
@@ -137,6 +138,10 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     STREAM_OVERLAP_SECONDS=0.5
     TRANSCRIPT_CONFIRM_UPDATES=2
 
+    # Optional: pin capture to a device reported by --list-audio-devices.
+    # Leave unset to follow the Windows system default across reconnects.
+    # AUDIO_INPUT_DEVICE_INDEX=2
+
     # Recover from microphone startup failures and live disconnections.
     AUDIO_RECONNECT_ENABLED=true
     AUDIO_RECONNECT_BASE_SECONDS=0.5
@@ -226,7 +231,13 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
     Diagnostics report only whether credentials are configured; they never print credential values.
 2.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
-3.  **Start the Pipeline with your `.env` default**:
+3.  **Choose a microphone when needed**: The system default is used automatically. On a multi-device installation, list available inputs and select one for the current run:
+    ```powershell
+    python transcriber.py --list-audio-devices
+    python transcriber.py --input-device 2
+    ```
+    To keep the selection across runs, set `AUDIO_INPUT_DEVICE_INDEX=2` in `.env`. Diagnostics use the same selected device.
+4.  **Start the Pipeline with your `.env` default**:
     ```bash
     python transcriber.py
     ```
@@ -248,7 +259,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     $env:TRANSCRIPTION_BACKEND = "groq"
     python transcriber.py
     ```
-4.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
+5.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
 
 ### OSC Output to TouchDesigner
 
@@ -270,6 +281,8 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 | `/audio_status` | `starting`, `ready`, `degraded`, `reconnecting`, `error`, or `stopped` |
 | `/audio_reconnects` | Total microphone reopen attempts during this run |
 | `/audio_error` | Most recent microphone error, cleared after recovery |
+| `/audio_device_index` | Resolved PyAudio input-device index, or `-1` before the system default resolves |
+| `/audio_device_name` | Resolved microphone name |
 | `/gender` | Active gender mode |
 | `/age` | Active age mode |
 | `/visual_mode` | Active visual identity mode |
