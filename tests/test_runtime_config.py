@@ -1,0 +1,224 @@
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from dataclasses import fields
+from pathlib import Path
+
+from runtime_config import (
+    ConfigError,
+    RuntimeConfig,
+    format_config_error,
+    format_config_report,
+    load_env_file,
+)
+
+
+class RuntimeConfigTests(unittest.TestCase):
+    def test_loads_typed_defaults(self):
+        config = RuntimeConfig.from_environment({})
+
+        self.assertEqual(config.transcription_backend, "whisper")
+        self.assertEqual(config.osc_port, 7000)
+        self.assertTrue(config.osc_control_enabled)
+        self.assertEqual(config.audio_input_device_index, None)
+        self.assertEqual(
+            config.prompt_tokenizer_models,
+            (
+                "openai/clip-vit-large-patch14",
+                "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+            ),
+        )
+
+    def test_every_setting_has_a_unique_environment_name(self):
+        environment_names = [
+            config_field.metadata["env"]
+            for config_field in fields(RuntimeConfig)
+        ]
+
+        self.assertEqual(len(environment_names), len(set(environment_names)))
+
+    def test_command_line_overrides_take_precedence(self):
+        config = RuntimeConfig.from_environment(
+            {
+                "TRANSCRIPTION_BACKEND": "whisper",
+                "AUDIO_INPUT_DEVICE_INDEX": "2",
+                "GROQ_API_KEY": "test-key",
+            },
+            backend_override="groq",
+            input_device_override=7,
+        )
+
+        self.assertEqual(config.transcription_backend, "groq")
+        self.assertEqual(config.audio_input_device_index, 7)
+
+    def test_rejects_malformed_numbers_and_booleans(self):
+        with self.assertRaises(ConfigError) as context:
+            RuntimeConfig.from_environment(
+                {
+                    "OSC_PORT": "seven-thousand",
+                    "OSC_CONTROL_ENABLED": "sometimes",
+                }
+            )
+
+        self.assertIn("OSC_PORT must be an integer", context.exception.errors)
+        self.assertTrue(
+            any(
+                message.startswith("OSC_CONTROL_ENABLED must be one of:")
+                for message in context.exception.errors
+            )
+        )
+
+    def test_rejects_invalid_ranges_and_cross_field_values(self):
+        with self.assertRaises(ConfigError) as context:
+            RuntimeConfig.from_environment(
+                {
+                    "OSC_PORT": "70000",
+                    "VAD_THRESHOLD": "1.2",
+                    "WHISPER_MIN_AUDIO_SECONDS": "8",
+                    "WHISPER_MAX_AUDIO_SECONDS": "4",
+                    "TRANSCRIPTION_RETRY_BASE_SECONDS": "12",
+                    "TRANSCRIPTION_RETRY_MAX_SECONDS": "3",
+                }
+            )
+
+        errors = context.exception.errors
+        self.assertIn("OSC_PORT must be between 1 and 65535", errors)
+        self.assertIn("VAD_THRESHOLD must be between 0 and 1", errors)
+        self.assertIn(
+            "WHISPER_MIN_AUDIO_SECONDS must not exceed WHISPER_MAX_AUDIO_SECONDS",
+            errors,
+        )
+        self.assertIn(
+            "TRANSCRIPTION_RETRY_BASE_SECONDS must not exceed "
+            "TRANSCRIPTION_RETRY_MAX_SECONDS",
+            errors,
+        )
+
+    def test_requires_a_real_groq_key_for_a_groq_backend(self):
+        for key in ("", "your_groq_key_here"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "TRANSCRIPTION_BACKEND=groq requires GROQ_API_KEY",
+                ):
+                    RuntimeConfig.from_environment(
+                        {
+                            "TRANSCRIPTION_BACKEND": "groq",
+                            "GROQ_API_KEY": key,
+                        }
+                    )
+
+    def test_preserves_legacy_online_timing_fallbacks(self):
+        config = RuntimeConfig.from_environment(
+            {
+                "ONLINE_TRANSCRIPTION_INTERVAL": "4.5",
+                "ONLINE_MIN_AUDIO_SECONDS": "2.25",
+            }
+        )
+
+        self.assertEqual(config.groq_transcription_interval, 4.5)
+        self.assertEqual(config.google_transcription_interval, 4.5)
+        self.assertEqual(config.groq_min_audio_seconds, 2.25)
+        self.assertEqual(config.google_min_audio_seconds, 2.25)
+
+    def test_report_redacts_secrets(self):
+        config = RuntimeConfig.from_environment(
+            {
+                "CAPRIOLE_API_KEY": "capriole-secret",
+                "GROQ_API_KEY": "groq-secret",
+            }
+        )
+
+        report = format_config_report(config)
+
+        self.assertNotIn("capriole-secret", report)
+        self.assertNotIn("groq-secret", report)
+        self.assertIn("CAPRIOLE_API_KEY", report)
+        self.assertIn("GROQ_API_KEY", report)
+        self.assertGreaterEqual(report.count("<redacted>"), 2)
+
+    def test_error_report_never_includes_unrelated_environment_values(self):
+        try:
+            RuntimeConfig.from_environment({"OSC_PORT": "invalid"})
+        except ConfigError as error:
+            report = format_config_error(error)
+        else:
+            self.fail("Expected invalid configuration")
+
+        self.assertIn("OSC_PORT must be an integer", report)
+        self.assertNotIn("invalid", report)
+
+
+class EnvironmentFileTests(unittest.TestCase):
+    def test_loads_values_without_overwriting_the_process_environment(self):
+        environment = {"OSC_PORT": "9000"}
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "# local values\nOSC_PORT=7000\nGROQ_API_KEY='secret'\n",
+                encoding="utf-8",
+            )
+
+            load_env_file(env_path, environment)
+
+        self.assertEqual(environment["OSC_PORT"], "9000")
+        self.assertEqual(environment["GROQ_API_KEY"], "secret")
+
+
+class ConfigCommandTests(unittest.TestCase):
+    @staticmethod
+    def clean_config_environment():
+        environment = os.environ.copy()
+        defaults = RuntimeConfig()
+        for config_field in fields(defaults):
+            env_name = config_field.metadata["env"]
+            value = getattr(defaults, config_field.name)
+            if value is None:
+                display = ""
+            elif isinstance(value, bool):
+                display = str(value).lower()
+            elif isinstance(value, tuple):
+                display = ",".join(str(item) for item in value)
+            else:
+                display = str(value)
+            environment[env_name] = display
+        environment["TRANSCRIPTION_BACKEND"] = "google"
+        return environment
+
+    def run_config_check(self, environment):
+        return subprocess.run(
+            [sys.executable, "transcriber.py", "--check-config"],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
+    def test_check_config_returns_two_for_invalid_values(self):
+        environment = self.clean_config_environment()
+        environment["OSC_PORT"] = "invalid"
+
+        result = self.run_config_check(environment)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("OSC_PORT must be an integer", result.stdout)
+
+    def test_check_config_redacts_secret_values(self):
+        environment = self.clean_config_environment()
+        environment["GROQ_API_KEY"] = "groq-test-secret"
+        environment["CAPRIOLE_API_KEY"] = "capriole-test-secret"
+
+        result = self.run_config_check(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("groq-test-secret", result.stdout)
+        self.assertNotIn("capriole-test-secret", result.stdout)
+        self.assertGreaterEqual(result.stdout.count("<redacted>"), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

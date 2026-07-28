@@ -20,6 +20,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
+- **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
 ## Tech Stack
@@ -93,6 +94,14 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
 
     The project ignores `.env` and `.env.*` files so API keys are not synced to GitHub. Keep `.env.example` placeholder-only.
+
+    After changing `.env`, validate the effective values before starting the audio or model runtimes:
+
+    ```powershell
+    python transcriber.py --check-config
+    ```
+
+    The command checks types, supported choices, ports, positive ranges, and related minimum/maximum settings. It prints the effective configuration while replacing configured API keys with `<redacted>`. Invalid settings return exit code `2` with all detected problems in one report.
 
     Set your Capriole API key (if using cloud models). You can do this in two ways:
 
@@ -225,19 +234,24 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
 
 ## Usage
 
-1.  **Check the machine once after setup or dependency changes**:
+1.  **Validate configuration after editing `.env`**:
+    ```powershell
+    python transcriber.py --check-config
+    ```
+    Command-line `--backend` and `--input-device` overrides are included in the displayed effective configuration.
+2.  **Check the machine once after setup or dependency changes**:
     ```powershell
     python transcriber.py --diagnose
     ```
-    Diagnostics report only whether credentials are configured; they never print credential values.
-2.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
-3.  **Choose a microphone when needed**: The system default is used automatically. On a multi-device installation, list available inputs and select one for the current run:
+    Diagnostics start from the same validated configuration and report only whether credentials are configured; they never print credential values.
+3.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
+4.  **Choose a microphone when needed**: The system default is used automatically. On a multi-device installation, list available inputs and select one for the current run:
     ```powershell
     python transcriber.py --list-audio-devices
     python transcriber.py --input-device 2
     ```
     To keep the selection across runs, set `AUDIO_INPUT_DEVICE_INDEX=2` in `.env`. Diagnostics use the same selected device.
-4.  **Start the Pipeline with your `.env` default**:
+5.  **Start the Pipeline with your `.env` default**:
     ```bash
     python transcriber.py
     ```
@@ -259,7 +273,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     $env:TRANSCRIPTION_BACKEND = "groq"
     python transcriber.py
     ```
-5.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
+6.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
 
 ### OSC Output to TouchDesigner
 
@@ -308,6 +322,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 ## Runtime Structure
 
 - `transcriber.py` coordinates model selection, live transcription, prompt generation, and process lifecycle.
+- `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.

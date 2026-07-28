@@ -19,6 +19,13 @@ from backend_errors import RetryableTranscriptionError, exponential_backoff, ret
 from diagnostics import run_diagnostics
 from osc_control import OscControlServer
 from prompt_engine import PromptBudgeter, RollingSceneMemory
+from runtime_config import (
+    ConfigError,
+    RuntimeConfig,
+    format_config_error,
+    format_config_report,
+    load_env_file,
+)
 from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
@@ -44,40 +51,6 @@ except ImportError:
     LangDetectException = Exception
 
 
-def load_env_file(path=".env"):
-    if not os.path.exists(path):
-        return
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
-
-
-def env_float(name, default):
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def env_bool(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def env_int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
 def optional_non_negative_int(value):
     if value is None or str(value).strip() == "":
         return None
@@ -88,17 +61,6 @@ def optional_non_negative_int(value):
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
     return parsed
-
-
-def env_optional_non_negative_int(name):
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        return None
-    try:
-        return optional_non_negative_int(value)
-    except argparse.ArgumentTypeError:
-        print(f"Invalid {name}='{value}'; using the system default input device.")
-        return None
 
 
 def parse_args(args=None):
@@ -136,6 +98,11 @@ def parse_args(args=None):
         action="store_true",
         help="Check the GPU, microphone, packages, OSC port, model cache, and credential hygiene."
     )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate and print the effective configuration with secrets redacted."
+    )
     return parser.parse_args(args)
 
 
@@ -143,11 +110,19 @@ load_env_file()
 ARGS = parse_args() if __name__ == "__main__" else parse_args([])
 
 # --- Configuration ---
-MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
-TRANSCRIPTION_BACKEND = (ARGS.backend or os.environ.get("TRANSCRIPTION_BACKEND", "whisper")).strip().lower()
-if TRANSCRIPTION_BACKEND not in {"whisper", "faster_whisper", "groq", "groq_hybrid", "google"}:
-    print(f"Unknown TRANSCRIPTION_BACKEND '{TRANSCRIPTION_BACKEND}', falling back to 'whisper'.")
-    TRANSCRIPTION_BACKEND = "whisper"
+try:
+    CONFIG = RuntimeConfig.from_environment(
+        backend_override=ARGS.backend,
+        input_device_override=ARGS.input_device,
+    )
+except ConfigError as exc:
+    if __name__ == "__main__":
+        print(format_config_error(exc))
+        raise SystemExit(2)
+    raise
+
+MODEL_SIZE = CONFIG.whisper_model_size
+TRANSCRIPTION_BACKEND = CONFIG.transcription_backend
 
 torch = None
 TORCH_IMPORT_ERROR = None
@@ -158,113 +133,87 @@ if TRANSCRIPTION_BACKEND in {"whisper", "faster_whisper"}:
     except Exception as exc:
         TORCH_IMPORT_ERROR = exc
 
-WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cuda").strip().lower()
+WHISPER_DEVICE = CONFIG.whisper_device
 if WHISPER_DEVICE:
     DEVICE = WHISPER_DEVICE
 else:
     DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
 
-WHISPER_TRANSCRIPTION_INTERVAL = env_float("WHISPER_TRANSCRIPTION_INTERVAL", 0.8)
-WHISPER_MIN_AUDIO_SECONDS = env_float("WHISPER_MIN_AUDIO_SECONDS", 0.8)
-WHISPER_MAX_AUDIO_SECONDS = env_float("WHISPER_MAX_AUDIO_SECONDS", 6.0)
-WHISPER_BEAM_SIZE = int(env_float("WHISPER_BEAM_SIZE", 1))
-WHISPER_BEST_OF = int(env_float("WHISPER_BEST_OF", 1))
-WHISPER_TEMPERATURE = env_float("WHISPER_TEMPERATURE", 0.0)
-WHISPER_CONDITION_ON_PREVIOUS_TEXT = env_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
-WHISPER_LOG_LATENCY = env_bool("WHISPER_LOG_LATENCY", True)
-FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8_float16").strip()
-FASTER_WHISPER_CPU_THREADS = env_int("FASTER_WHISPER_CPU_THREADS", 4)
-FASTER_WHISPER_NUM_WORKERS = env_int("FASTER_WHISPER_NUM_WORKERS", 1)
+WHISPER_TRANSCRIPTION_INTERVAL = CONFIG.whisper_transcription_interval
+WHISPER_MIN_AUDIO_SECONDS = CONFIG.whisper_min_audio_seconds
+WHISPER_MAX_AUDIO_SECONDS = CONFIG.whisper_max_audio_seconds
+WHISPER_BEAM_SIZE = CONFIG.whisper_beam_size
+WHISPER_BEST_OF = CONFIG.whisper_best_of
+WHISPER_TEMPERATURE = CONFIG.whisper_temperature
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = CONFIG.whisper_condition_on_previous_text
+WHISPER_LOG_LATENCY = CONFIG.whisper_log_latency
+FASTER_WHISPER_COMPUTE_TYPE = CONFIG.faster_whisper_compute_type
+FASTER_WHISPER_CPU_THREADS = CONFIG.faster_whisper_cpu_threads
+FASTER_WHISPER_NUM_WORKERS = CONFIG.faster_whisper_num_workers
 
-SCENE_MEMORY_MAX_WORDS = max(1, env_int("SCENE_MEMORY_MAX_WORDS", 36))
-SCENE_MEMORY_MAX_AGE_SECONDS = env_float("SCENE_MEMORY_MAX_AGE_SECONDS", 20.0)
-PROMPT_TOKEN_BUDGET_ENABLED = env_bool("PROMPT_TOKEN_BUDGET_ENABLED", True)
-PROMPT_MAX_TOKENS = max(1, env_int("PROMPT_MAX_TOKENS", 77))
-PROMPT_MIN_TRANSCRIPT_TOKENS = max(0, env_int("PROMPT_MIN_TRANSCRIPT_TOKENS", 20))
-PROMPT_LOG_TOKENS = env_bool("PROMPT_LOG_TOKENS", True)
-PROMPT_TOKENIZER_MODELS = [
-    model.strip()
-    for model in os.environ.get(
-        "PROMPT_TOKENIZER_MODELS",
-        "openai/clip-vit-large-patch14,laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
-    ).split(",")
-    if model.strip()
-]
+SCENE_MEMORY_MAX_WORDS = CONFIG.scene_memory_max_words
+SCENE_MEMORY_MAX_AGE_SECONDS = CONFIG.scene_memory_max_age_seconds
+PROMPT_TOKEN_BUDGET_ENABLED = CONFIG.prompt_token_budget_enabled
+PROMPT_MAX_TOKENS = CONFIG.prompt_max_tokens
+PROMPT_MIN_TRANSCRIPT_TOKENS = CONFIG.prompt_min_transcript_tokens
+PROMPT_LOG_TOKENS = CONFIG.prompt_log_tokens
+PROMPT_TOKENIZER_MODELS = list(CONFIG.prompt_tokenizer_models)
 
-OSC_IP = os.environ.get("OSC_IP", "127.0.0.1")
-OSC_PORT = env_int("OSC_PORT", 7000)
-OSC_CONTROL_ENABLED = env_bool("OSC_CONTROL_ENABLED", True)
-OSC_CONTROL_IP = os.environ.get("OSC_CONTROL_IP", "127.0.0.1")
-OSC_CONTROL_PORT = env_int("OSC_CONTROL_PORT", 7001)
-OSC_STATUS_INTERVAL = max(0.1, env_float("OSC_STATUS_INTERVAL", 0.5))
+OSC_IP = CONFIG.osc_ip
+OSC_PORT = CONFIG.osc_port
+OSC_CONTROL_ENABLED = CONFIG.osc_control_enabled
+OSC_CONTROL_IP = CONFIG.osc_control_ip
+OSC_CONTROL_PORT = CONFIG.osc_control_port
+OSC_STATUS_INTERVAL = CONFIG.osc_status_interval
 
-TRANSCRIPTION_MAX_FINAL_JOBS = max(1, env_int("TRANSCRIPTION_MAX_FINAL_JOBS", 8))
-TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS = max(
-    0.0,
-    env_float("TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS", 4.0),
+TRANSCRIPTION_MAX_FINAL_JOBS = CONFIG.transcription_max_final_jobs
+TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS = (
+    CONFIG.transcription_partial_max_age_seconds
 )
-TRANSCRIPTION_FINAL_MAX_AGE_SECONDS = max(
-    0.0,
-    env_float("TRANSCRIPTION_FINAL_MAX_AGE_SECONDS", 30.0),
-)
-TRANSCRIPTION_FINAL_MAX_RETRIES = max(0, env_int("TRANSCRIPTION_FINAL_MAX_RETRIES", 2))
-TRANSCRIPTION_RETRY_BASE_SECONDS = max(0.1, env_float("TRANSCRIPTION_RETRY_BASE_SECONDS", 1.0))
-TRANSCRIPTION_RETRY_MAX_SECONDS = max(
-    TRANSCRIPTION_RETRY_BASE_SECONDS,
-    env_float("TRANSCRIPTION_RETRY_MAX_SECONDS", 10.0),
-)
+TRANSCRIPTION_FINAL_MAX_AGE_SECONDS = CONFIG.transcription_final_max_age_seconds
+TRANSCRIPTION_FINAL_MAX_RETRIES = CONFIG.transcription_final_max_retries
+TRANSCRIPTION_RETRY_BASE_SECONDS = CONFIG.transcription_retry_base_seconds
+TRANSCRIPTION_RETRY_MAX_SECONDS = CONFIG.transcription_retry_max_seconds
 
 # Online transcription is useful when TouchDesigner/StreamDiffusion needs the GPU.
 # Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
-GROQ_HYBRID_MODEL = os.environ.get("GROQ_HYBRID_MODEL", "whisper-large-v3-turbo")
-GROQ_TEXT_TRANSLATION_MODEL = os.environ.get("GROQ_TEXT_TRANSLATION_MODEL", "llama-3.1-8b-instant")
-GROQ_TRANSCRIPTIONS_ENDPOINT = os.environ.get(
-    "GROQ_TRANSCRIPTIONS_ENDPOINT",
-    "https://api.groq.com/openai/v1/audio/transcriptions"
-)
-GROQ_TRANSLATIONS_ENDPOINT = os.environ.get(
-    "GROQ_TRANSLATIONS_ENDPOINT",
-    "https://api.groq.com/openai/v1/audio/translations"
-)
-GROQ_CHAT_ENDPOINT = os.environ.get(
-    "GROQ_CHAT_ENDPOINT",
-    "https://api.groq.com/openai/v1/chat/completions"
-)
-GROQ_TRANSLATION_PROMPT = os.environ.get(
-    "GROQ_TRANSLATION_PROMPT",
-    "Translate all speech to natural concise English for a visual generation prompt."
-)
-GROQ_RESPONSE_FORMAT = os.environ.get("GROQ_RESPONSE_FORMAT", "text")
-GROQ_TRANSCRIPTION_INTERVAL = env_float("GROQ_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 3.2))
-GROQ_MIN_AUDIO_SECONDS = env_float("GROQ_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 1.0))
-GROQ_MAX_AUDIO_SECONDS = env_float("GROQ_MAX_AUDIO_SECONDS", 6.0)
-GROQ_REQUEST_TIMEOUT = env_float("GROQ_REQUEST_TIMEOUT", 20.0)
-GROQ_LOG_LATENCY = env_bool("GROQ_LOG_LATENCY", True)
-GROQ_ENGLISH_FALLBACK = os.environ.get("GROQ_ENGLISH_FALLBACK", "auto").strip().lower()
+GROQ_API_KEY = CONFIG.groq_api_key
+GROQ_MODEL = CONFIG.groq_transcription_model
+GROQ_HYBRID_MODEL = CONFIG.groq_hybrid_model
+GROQ_TEXT_TRANSLATION_MODEL = CONFIG.groq_text_translation_model
+GROQ_TRANSCRIPTIONS_ENDPOINT = CONFIG.groq_transcriptions_endpoint
+GROQ_TRANSLATIONS_ENDPOINT = CONFIG.groq_translations_endpoint
+GROQ_CHAT_ENDPOINT = CONFIG.groq_chat_endpoint
+GROQ_TRANSLATION_PROMPT = CONFIG.groq_translation_prompt
+GROQ_RESPONSE_FORMAT = CONFIG.groq_response_format
+GROQ_TRANSCRIPTION_INTERVAL = CONFIG.groq_transcription_interval
+GROQ_MIN_AUDIO_SECONDS = CONFIG.groq_min_audio_seconds
+GROQ_MAX_AUDIO_SECONDS = CONFIG.groq_max_audio_seconds
+GROQ_REQUEST_TIMEOUT = CONFIG.groq_request_timeout
+GROQ_LOG_LATENCY = CONFIG.groq_log_latency
+GROQ_ENGLISH_FALLBACK = CONFIG.groq_english_fallback
 
-LOCAL_TRANSLATOR = os.environ.get("LOCAL_TRANSLATOR", "argos").strip().lower()
-LOCAL_TRANSLATOR_TARGET_LANGUAGE = os.environ.get("LOCAL_TRANSLATOR_TARGET_LANGUAGE", "en").strip().lower()
-LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE = os.environ.get("LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE", "zh").strip().lower()
-LOCAL_TRANSLATOR_AUTO_INSTALL = env_bool("LOCAL_TRANSLATOR_AUTO_INSTALL", True)
-LOCAL_TRANSLATOR_PRELOAD_LANGUAGES = [
-    lang.strip().lower()
-    for lang in os.environ.get("LOCAL_TRANSLATOR_PRELOAD_LANGUAGES", "zh,es").split(",")
-    if lang.strip()
-]
-LOCAL_TRANSLATOR_LOG_LATENCY = env_bool("LOCAL_TRANSLATOR_LOG_LATENCY", True)
-HYBRID_TRANSLATION_FALLBACK = os.environ.get("HYBRID_TRANSLATION_FALLBACK", "groq_text").strip().lower()
+LOCAL_TRANSLATOR = CONFIG.local_translator
+LOCAL_TRANSLATOR_TARGET_LANGUAGE = CONFIG.local_translator_target_language
+LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE = (
+    CONFIG.local_translator_default_source_language
+)
+LOCAL_TRANSLATOR_AUTO_INSTALL = CONFIG.local_translator_auto_install
+LOCAL_TRANSLATOR_PRELOAD_LANGUAGES = list(
+    CONFIG.local_translator_preload_languages
+)
+LOCAL_TRANSLATOR_LOG_LATENCY = CONFIG.local_translator_log_latency
+HYBRID_TRANSLATION_FALLBACK = CONFIG.hybrid_translation_fallback
 
 # This free Google path is recognition-only and does not translate to English.
-GOOGLE_TRANSCRIPTION_INTERVAL = env_float("GOOGLE_TRANSCRIPTION_INTERVAL", env_float("ONLINE_TRANSCRIPTION_INTERVAL", 2.0))
-GOOGLE_MIN_AUDIO_SECONDS = env_float("GOOGLE_MIN_AUDIO_SECONDS", env_float("ONLINE_MIN_AUDIO_SECONDS", 1.5))
-GOOGLE_MAX_AUDIO_SECONDS = env_float("GOOGLE_MAX_AUDIO_SECONDS", 5.0)
-GOOGLE_SPEECH_LANGUAGE = os.environ.get("GOOGLE_SPEECH_LANGUAGE", "en-US")
+GOOGLE_TRANSCRIPTION_INTERVAL = CONFIG.google_transcription_interval
+GOOGLE_MIN_AUDIO_SECONDS = CONFIG.google_min_audio_seconds
+GOOGLE_MAX_AUDIO_SECONDS = CONFIG.google_max_audio_seconds
+GOOGLE_SPEECH_LANGUAGE = CONFIG.google_speech_language
 GOOGLE_LANGUAGE_MAP = {
-    "en": os.environ.get("GOOGLE_SPEECH_ENGLISH_LANGUAGE", "en-US"),
-    "zh": os.environ.get("GOOGLE_SPEECH_CHINESE_LANGUAGE", "zh-CN"),
-    "es": os.environ.get("GOOGLE_SPEECH_SPANISH_LANGUAGE", "es-ES"),
+    "en": CONFIG.google_speech_english_language,
+    "zh": CONFIG.google_speech_chinese_language,
+    "es": CONFIG.google_speech_spanish_language,
 }
 
 # --- FIXED PROMPT STRATEGY ---
@@ -353,35 +302,19 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16 if pyaudio is not None else None
 CHANNELS = 1
 RATE = 16000
-AUDIO_INPUT_DEVICE_INDEX = (
-    ARGS.input_device
-    if ARGS.input_device is not None
-    else env_optional_non_negative_int("AUDIO_INPUT_DEVICE_INDEX")
-)
-VAD_ENGINE = os.environ.get("VAD_ENGINE", "silero").strip().lower()
-VAD_THRESHOLD = env_float("VAD_THRESHOLD", 0.5)
-VAD_ENERGY_THRESHOLD = env_float("VAD_ENERGY_THRESHOLD", 400.0)
-VAD_PRE_ROLL_SECONDS = env_float("VAD_PRE_ROLL_SECONDS", 0.32)
-VAD_SILENCE_SECONDS = env_float("VAD_SILENCE_SECONDS", 0.7)
-STREAM_OVERLAP_SECONDS = env_float("STREAM_OVERLAP_SECONDS", 0.5)
-TRANSCRIPT_CONFIRM_UPDATES = max(1, env_int("TRANSCRIPT_CONFIRM_UPDATES", 2))
-AUDIO_RECONNECT_ENABLED = env_bool("AUDIO_RECONNECT_ENABLED", True)
-AUDIO_RECONNECT_BASE_SECONDS = max(
-    0.1,
-    env_float("AUDIO_RECONNECT_BASE_SECONDS", 0.5),
-)
-AUDIO_RECONNECT_MAX_SECONDS = max(
-    AUDIO_RECONNECT_BASE_SECONDS,
-    env_float("AUDIO_RECONNECT_MAX_SECONDS", 8.0),
-)
-AUDIO_MAX_CONSECUTIVE_READ_ERRORS = max(
-    1,
-    env_int("AUDIO_MAX_CONSECUTIVE_READ_ERRORS", 3),
-)
-AUDIO_READ_RETRY_SECONDS = max(
-    0.0,
-    env_float("AUDIO_READ_RETRY_SECONDS", 0.1),
-)
+AUDIO_INPUT_DEVICE_INDEX = CONFIG.audio_input_device_index
+VAD_ENGINE = CONFIG.vad_engine
+VAD_THRESHOLD = CONFIG.vad_threshold
+VAD_ENERGY_THRESHOLD = CONFIG.vad_energy_threshold
+VAD_PRE_ROLL_SECONDS = CONFIG.vad_pre_roll_seconds
+VAD_SILENCE_SECONDS = CONFIG.vad_silence_seconds
+STREAM_OVERLAP_SECONDS = CONFIG.stream_overlap_seconds
+TRANSCRIPT_CONFIRM_UPDATES = CONFIG.transcript_confirm_updates
+AUDIO_RECONNECT_ENABLED = CONFIG.audio_reconnect_enabled
+AUDIO_RECONNECT_BASE_SECONDS = CONFIG.audio_reconnect_base_seconds
+AUDIO_RECONNECT_MAX_SECONDS = CONFIG.audio_reconnect_max_seconds
+AUDIO_MAX_CONSECUTIVE_READ_ERRORS = CONFIG.audio_max_consecutive_read_errors
+AUDIO_READ_RETRY_SECONDS = CONFIG.audio_read_retry_seconds
 
 
 def print_audio_input_devices():
@@ -424,8 +357,10 @@ class RealTimePipeline:
         enable_osc=True,
         enable_prompt_budget=True,
         enable_osc_controls=True,
+        config=None,
     ):
-        self.backend = TRANSCRIPTION_BACKEND
+        self.config = config or CONFIG
+        self.backend = self.config.transcription_backend
         self.model = None
         self.online_recognizer = None
         self.last_online_request_time = 0
@@ -1295,6 +1230,9 @@ class RealTimePipeline:
             ) from exc
 
     def initialize_local_translator(self):
+        if LOCAL_TRANSLATOR in {"none", "off"}:
+            print("[LOCAL TRANSLATOR]: Disabled. Non-English text will pass through.")
+            return
         if LOCAL_TRANSLATOR != "argos":
             print(f"[LOCAL TRANSLATOR]: Unknown translator '{LOCAL_TRANSLATOR}'. Non-English text will pass through.")
             return
@@ -1623,22 +1561,20 @@ class RealTimePipeline:
                 self.osc_control_server.stop()
 
 if __name__ == "__main__":
+    if ARGS.check_config:
+        print(format_config_report(CONFIG))
+        raise SystemExit(0)
+
     if ARGS.list_audio_devices:
         raise SystemExit(print_audio_input_devices())
 
     if ARGS.diagnose:
         raise SystemExit(
             run_diagnostics(
-                backend=TRANSCRIPTION_BACKEND,
-                model_size=MODEL_SIZE,
-                device=DEVICE,
+                config=CONFIG,
                 sample_rate=RATE,
                 chunk_size=CHUNK,
-                osc_control_ip=OSC_CONTROL_IP,
-                osc_control_port=OSC_CONTROL_PORT,
-                groq_key_configured=bool(GROQ_API_KEY),
-                capriole_key_configured=bool(os.environ.get("CAPRIOLE_API_KEY")),
-                audio_input_device_index=AUDIO_INPUT_DEVICE_INDEX,
+                device=DEVICE,
             )
         )
 
@@ -1647,6 +1583,7 @@ if __name__ == "__main__":
         enable_osc=not bool(ARGS.benchmark),
         enable_prompt_budget=not bool(ARGS.benchmark),
         enable_osc_controls=not bool(ARGS.benchmark),
+        config=CONFIG,
     )
     if ARGS.benchmark:
         pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
