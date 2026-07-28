@@ -17,11 +17,15 @@ class CudaDiagnosticTests(unittest.TestCase):
     def test_broken_torch_is_informational_for_online_backends(self):
         with (
             patch("diagnostics.importlib.util.find_spec", return_value=object()),
-            patch("builtins.__import__", side_effect=self.failing_torch_import),
+            patch("diagnostics.metadata.version", return_value="2.7.0"),
+            patch("builtins.__import__", side_effect=self.failing_torch_import) as importer,
         ):
             results = _cuda_results("cuda", required=False)
 
         self.assertEqual(results[0].status, "INFO")
+        self.assertIn("not loaded", results[0].detail)
+        self.assertEqual(results[1].status, "INFO")
+        importer.assert_not_called()
 
     def test_broken_torch_fails_a_local_backend(self):
         with (

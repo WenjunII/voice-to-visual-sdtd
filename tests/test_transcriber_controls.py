@@ -9,6 +9,11 @@ from transcriber import RealTimePipeline, parse_args
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_accepts_the_config_check_flag(self):
+        args = parse_args(["--check-config"])
+
+        self.assertTrue(args.check_config)
+
     def test_accepts_an_audio_input_device_override(self):
         args = parse_args(["--input-device", "4"])
 

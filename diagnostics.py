@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 from audio_runtime import get_audio_input_device
@@ -17,26 +18,45 @@ class DiagnosticResult:
 
 
 def run_diagnostics(
-    backend,
-    model_size,
-    device,
+    config,
     sample_rate,
     chunk_size,
-    osc_control_ip,
-    osc_control_port,
-    groq_key_configured,
-    capriole_key_configured,
-    audio_input_device_index=None,
+    device=None,
 ):
-    results = []
+    backend = config.transcription_backend
+    effective_device = device or config.whisper_device
+    results = [DiagnosticResult("Configuration", "PASS", "validated")]
     results.append(_python_result())
-    results.extend(_cuda_results(device, required=backend in {"whisper", "faster_whisper"}))
+    results.extend(
+        _cuda_results(
+            effective_device,
+            required=backend in {"whisper", "faster_whisper"},
+        )
+    )
     results.extend(_package_results(backend))
-    results.append(_microphone_result(sample_rate, chunk_size, audio_input_device_index))
-    results.append(_udp_bind_result(osc_control_ip, osc_control_port))
-    results.append(_model_cache_result(model_size))
-    results.append(_credential_result("Groq credential", groq_key_configured))
-    results.append(_credential_result("Capriole credential", capriole_key_configured))
+    results.append(
+        _microphone_result(
+            sample_rate,
+            chunk_size,
+            config.audio_input_device_index,
+        )
+    )
+    results.append(
+        _udp_bind_result(config.osc_control_ip, config.osc_control_port)
+    )
+    results.append(_model_cache_result(config.whisper_model_size))
+    results.append(
+        _credential_result(
+            "Groq credential",
+            config.is_secret_configured(config.groq_api_key),
+        )
+    )
+    results.append(
+        _credential_result(
+            "Capriole credential",
+            config.is_secret_configured(config.capriole_api_key),
+        )
+    )
     results.append(_env_ignore_result())
 
     print("\n" + "=" * 72)
@@ -64,6 +84,23 @@ def _cuda_results(device, required):
     if importlib.util.find_spec("torch") is None:
         status = "FAIL" if required else "INFO"
         return [DiagnosticResult("PyTorch", status, "not installed")]
+    if not required:
+        try:
+            version = metadata.version("torch")
+        except (metadata.PackageNotFoundError, ValueError):
+            version = "installed"
+        return [
+            DiagnosticResult(
+                "PyTorch",
+                "INFO",
+                f"{version}; not loaded for the online backend",
+            ),
+            DiagnosticResult(
+                "CUDA GPU",
+                "INFO",
+                "not checked because a local CUDA backend is not selected",
+            ),
+        ]
     try:
         import torch
 
