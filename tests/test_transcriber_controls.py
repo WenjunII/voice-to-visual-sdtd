@@ -5,6 +5,7 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from runtime_config import RuntimeConfig
 from transcriber import RealTimePipeline, parse_args
 
 
@@ -123,6 +124,55 @@ class RealTimePipelineControlTests(unittest.TestCase):
             for call in pipeline.osc_client.send_message.call_args_list
         }
         self.assertTrue(expected.issubset(calls))
+
+
+class BackendAdapterIntegrationTests(unittest.TestCase):
+    def make_pipeline(self, *, online=True):
+        adapter = Mock()
+        adapter.name = "google" if online else "whisper"
+        adapter.online = online
+        adapter.request_interval = 2.5
+        adapter.minimum_audio_seconds = 1.25
+        adapter.maximum_audio_seconds = 5.0
+        adapter.transcribe.return_value = "adapter transcript"
+        pipeline = RealTimePipeline(
+            enable_vad=False,
+            enable_osc=False,
+            enable_prompt_budget=False,
+            enable_osc_controls=False,
+            config=RuntimeConfig(),
+            backend_adapter=adapter,
+        )
+        return pipeline, adapter
+
+    def test_delegates_transcription_and_language_to_the_adapter(self):
+        pipeline, adapter = self.make_pipeline()
+        pipeline.current_language = "es"
+        samples = object()
+
+        text = pipeline.transcribe_audio(samples)
+
+        self.assertEqual(text, "adapter transcript")
+        adapter.transcribe.assert_called_once_with(
+            samples,
+            language="es",
+        )
+
+    def test_uses_adapter_audio_and_timing_limits(self):
+        pipeline, _adapter = self.make_pipeline()
+
+        self.assertEqual(pipeline.minimum_audio_seconds(), 1.25)
+        self.assertEqual(pipeline.maximum_audio_seconds(), 5.0)
+        self.assertEqual(pipeline.online_request_interval(), 2.5)
+        self.assertEqual(pipeline.local_request_interval(), 0.0)
+
+    def test_closes_the_backend_adapter(self):
+        pipeline, adapter = self.make_pipeline()
+
+        pipeline.close()
+        pipeline.close()
+
+        adapter.close.assert_called_once_with()
 
 
 class MicrophoneRecoveryTests(unittest.TestCase):

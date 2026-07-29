@@ -1,9 +1,7 @@
 import os
-import io
 import wave
 import argparse
 import numpy as np
-import requests
 import threading
 import time
 from pythonosc import udp_client
@@ -15,7 +13,7 @@ from audio_runtime import (
     get_audio_input_device,
     list_audio_input_devices,
 )
-from backend_errors import RetryableTranscriptionError, exponential_backoff, retry_after_seconds
+from backend_errors import RetryableTranscriptionError, exponential_backoff
 from diagnostics import run_diagnostics
 from osc_control import OscControlServer
 from prompt_engine import PromptBudgeter, RollingSceneMemory
@@ -29,6 +27,7 @@ from runtime_config import (
 from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
+from transcription_backends import create_transcription_backend
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -37,19 +36,6 @@ try:
     import pyaudio
 except ImportError:
     pyaudio = None
-
-try:
-    import speech_recognition as sr
-except ImportError:
-    sr = None
-
-try:
-    from langdetect import detect as detect_language
-    from langdetect.lang_detect_exception import LangDetectException
-except ImportError:
-    detect_language = None
-    LangDetectException = Exception
-
 
 def optional_non_negative_int(value):
     if value is None or str(value).strip() == "":
@@ -121,36 +107,6 @@ except ConfigError as exc:
         raise SystemExit(2)
     raise
 
-MODEL_SIZE = CONFIG.whisper_model_size
-TRANSCRIPTION_BACKEND = CONFIG.transcription_backend
-
-torch = None
-TORCH_IMPORT_ERROR = None
-if TRANSCRIPTION_BACKEND in {"whisper", "faster_whisper"}:
-    try:
-        import torch as torch_module
-        torch = torch_module
-    except Exception as exc:
-        TORCH_IMPORT_ERROR = exc
-
-WHISPER_DEVICE = CONFIG.whisper_device
-if WHISPER_DEVICE:
-    DEVICE = WHISPER_DEVICE
-else:
-    DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
-
-WHISPER_TRANSCRIPTION_INTERVAL = CONFIG.whisper_transcription_interval
-WHISPER_MIN_AUDIO_SECONDS = CONFIG.whisper_min_audio_seconds
-WHISPER_MAX_AUDIO_SECONDS = CONFIG.whisper_max_audio_seconds
-WHISPER_BEAM_SIZE = CONFIG.whisper_beam_size
-WHISPER_BEST_OF = CONFIG.whisper_best_of
-WHISPER_TEMPERATURE = CONFIG.whisper_temperature
-WHISPER_CONDITION_ON_PREVIOUS_TEXT = CONFIG.whisper_condition_on_previous_text
-WHISPER_LOG_LATENCY = CONFIG.whisper_log_latency
-FASTER_WHISPER_COMPUTE_TYPE = CONFIG.faster_whisper_compute_type
-FASTER_WHISPER_CPU_THREADS = CONFIG.faster_whisper_cpu_threads
-FASTER_WHISPER_NUM_WORKERS = CONFIG.faster_whisper_num_workers
-
 SCENE_MEMORY_MAX_WORDS = CONFIG.scene_memory_max_words
 SCENE_MEMORY_MAX_AGE_SECONDS = CONFIG.scene_memory_max_age_seconds
 PROMPT_TOKEN_BUDGET_ENABLED = CONFIG.prompt_token_budget_enabled
@@ -174,47 +130,6 @@ TRANSCRIPTION_FINAL_MAX_AGE_SECONDS = CONFIG.transcription_final_max_age_seconds
 TRANSCRIPTION_FINAL_MAX_RETRIES = CONFIG.transcription_final_max_retries
 TRANSCRIPTION_RETRY_BASE_SECONDS = CONFIG.transcription_retry_base_seconds
 TRANSCRIPTION_RETRY_MAX_SECONDS = CONFIG.transcription_retry_max_seconds
-
-# Online transcription is useful when TouchDesigner/StreamDiffusion needs the GPU.
-# Groq's hosted Whisper translation endpoint keeps prompts in English without local GPU work.
-GROQ_API_KEY = CONFIG.groq_api_key
-GROQ_MODEL = CONFIG.groq_transcription_model
-GROQ_HYBRID_MODEL = CONFIG.groq_hybrid_model
-GROQ_TEXT_TRANSLATION_MODEL = CONFIG.groq_text_translation_model
-GROQ_TRANSCRIPTIONS_ENDPOINT = CONFIG.groq_transcriptions_endpoint
-GROQ_TRANSLATIONS_ENDPOINT = CONFIG.groq_translations_endpoint
-GROQ_CHAT_ENDPOINT = CONFIG.groq_chat_endpoint
-GROQ_TRANSLATION_PROMPT = CONFIG.groq_translation_prompt
-GROQ_RESPONSE_FORMAT = CONFIG.groq_response_format
-GROQ_TRANSCRIPTION_INTERVAL = CONFIG.groq_transcription_interval
-GROQ_MIN_AUDIO_SECONDS = CONFIG.groq_min_audio_seconds
-GROQ_MAX_AUDIO_SECONDS = CONFIG.groq_max_audio_seconds
-GROQ_REQUEST_TIMEOUT = CONFIG.groq_request_timeout
-GROQ_LOG_LATENCY = CONFIG.groq_log_latency
-GROQ_ENGLISH_FALLBACK = CONFIG.groq_english_fallback
-
-LOCAL_TRANSLATOR = CONFIG.local_translator
-LOCAL_TRANSLATOR_TARGET_LANGUAGE = CONFIG.local_translator_target_language
-LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE = (
-    CONFIG.local_translator_default_source_language
-)
-LOCAL_TRANSLATOR_AUTO_INSTALL = CONFIG.local_translator_auto_install
-LOCAL_TRANSLATOR_PRELOAD_LANGUAGES = list(
-    CONFIG.local_translator_preload_languages
-)
-LOCAL_TRANSLATOR_LOG_LATENCY = CONFIG.local_translator_log_latency
-HYBRID_TRANSLATION_FALLBACK = CONFIG.hybrid_translation_fallback
-
-# This free Google path is recognition-only and does not translate to English.
-GOOGLE_TRANSCRIPTION_INTERVAL = CONFIG.google_transcription_interval
-GOOGLE_MIN_AUDIO_SECONDS = CONFIG.google_min_audio_seconds
-GOOGLE_MAX_AUDIO_SECONDS = CONFIG.google_max_audio_seconds
-GOOGLE_SPEECH_LANGUAGE = CONFIG.google_speech_language
-GOOGLE_LANGUAGE_MAP = {
-    "en": CONFIG.google_speech_english_language,
-    "zh": CONFIG.google_speech_chinese_language,
-    "es": CONFIG.google_speech_spanish_language,
-}
 
 # --- FIXED PROMPT STRATEGY ---
 # GENDER MODES: Press 'm' for Man, 'w' for Woman, 'n' for Neutral (General)
@@ -358,88 +273,22 @@ class RealTimePipeline:
         enable_prompt_budget=True,
         enable_osc_controls=True,
         config=None,
+        backend_adapter=None,
     ):
         self.config = config or CONFIG
-        self.backend = self.config.transcription_backend
-        self.model = None
-        self.online_recognizer = None
+        self.backend_adapter = (
+            backend_adapter
+            if backend_adapter is not None
+            else create_transcription_backend(
+                self.config,
+                sample_rate=RATE,
+            )
+        )
+        self._backend_closed = False
+        self.backend = self.backend_adapter.name
         self.last_online_request_time = 0
         self.last_whisper_request_time = 0
         self.backend_retry_not_before = 0.0
-        self.http = requests.Session() if self.backend in {"groq", "groq_hybrid"} else None
-        self.argos_package = None
-        self.argos_translate = None
-        self.local_translation_cache = {}
-
-        if self.backend in {"whisper", "faster_whisper"}:
-            if torch is None:
-                raise RuntimeError(
-                    f"TRANSCRIPTION_BACKEND={self.backend} requires torch. Run: pip install -r requirements.txt"
-                ) from TORCH_IMPORT_ERROR
-            if not DEVICE.startswith("cuda") or not torch.cuda.is_available():
-                raise RuntimeError(
-                    f"TRANSCRIPTION_BACKEND={self.backend} is configured to require a CUDA GPU. "
-                    "Use TRANSCRIPTION_BACKEND=groq for online translation without local GPU usage."
-                )
-
-        if self.backend == "whisper":
-            try:
-                import whisper
-            except ImportError as exc:
-                raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=whisper requires openai-whisper. "
-                    "Run: pip install -r requirements.txt"
-                ) from exc
-
-            print(f"Loading Whisper model '{MODEL_SIZE}' on {DEVICE}...")
-            self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
-        elif self.backend == "faster_whisper":
-            try:
-                from faster_whisper import WhisperModel
-            except ImportError as exc:
-                raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=faster_whisper requires faster-whisper. "
-                    "Run: pip install -r requirements.txt"
-                ) from exc
-
-            print(
-                f"Loading faster-whisper model '{MODEL_SIZE}' on {DEVICE} "
-                f"({FASTER_WHISPER_COMPUTE_TYPE})..."
-            )
-            try:
-                self.model = WhisperModel(
-                    MODEL_SIZE,
-                    device=DEVICE,
-                    compute_type=FASTER_WHISPER_COMPUTE_TYPE,
-                    cpu_threads=FASTER_WHISPER_CPU_THREADS,
-                    num_workers=FASTER_WHISPER_NUM_WORKERS,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "faster-whisper could not initialize CUDA. This project pins CTranslate2 for "
-                    "CUDA 12 with cuDNN 8; verify that the NVIDIA libraries are available on PATH."
-                ) from exc
-        elif self.backend in {"groq", "groq_hybrid"}:
-            if not GROQ_API_KEY:
-                raise RuntimeError(
-                    f"TRANSCRIPTION_BACKEND={self.backend} requires GROQ_API_KEY in your environment or .env file."
-                )
-            if self.backend == "groq":
-                print(f"Using Groq online Whisper translation backend ({GROQ_MODEL}). No local Whisper model loaded.")
-                print("Note: this sends microphone audio to Groq and returns English text for StreamDiffusion prompts.")
-            else:
-                print(f"Using Groq hybrid backend ({GROQ_HYBRID_MODEL}) with local CPU text translation.")
-                print("Note: Groq transcribes audio online; non-English text is translated locally when possible.")
-                self.initialize_local_translator()
-        else:
-            if sr is None:
-                raise RuntimeError(
-                    "TRANSCRIPTION_BACKEND=google requires the SpeechRecognition package. "
-                    "Run: pip install SpeechRecognition"
-                )
-            print("Using online Google Speech Recognition backend. No local Whisper model loaded.")
-            print("Note: this sends microphone audio to Google's speech service and does not translate to English.")
-            self.online_recognizer = sr.Recognizer()
 
         self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT) if enable_osc else None
         self.osc_control_enabled = bool(enable_osc_controls and OSC_CONTROL_ENABLED)
@@ -473,8 +322,13 @@ class RealTimePipeline:
         self.audio_status = "starting"
         self.audio_reconnects = 0
         self.last_audio_error = ""
-        self.audio_device_index = AUDIO_INPUT_DEVICE_INDEX if AUDIO_INPUT_DEVICE_INDEX is not None else -1
-        self.audio_device_name = "system default" if AUDIO_INPUT_DEVICE_INDEX is None else ""
+        configured_device = self.config.audio_input_device_index
+        self.audio_device_index = (
+            configured_device if configured_device is not None else -1
+        )
+        self.audio_device_name = (
+            "system default" if configured_device is None else ""
+        )
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
@@ -779,12 +633,12 @@ class RealTimePipeline:
     def request_interval_ready(self, now):
         if now < self.backend_retry_not_before:
             return False
-        if self.backend in {"groq", "groq_hybrid", "google"}:
+        if self.backend_adapter.online:
             return now - self.last_online_request_time >= self.online_request_interval()
         return now - self.last_whisper_request_time >= self.local_request_interval()
 
     def mark_request_started(self, now):
-        if self.backend in {"groq", "groq_hybrid", "google"}:
+        if self.backend_adapter.online:
             self.last_online_request_time = now
         else:
             self.last_whisper_request_time = now
@@ -995,404 +849,26 @@ class RealTimePipeline:
         return result.text
 
     def transcribe_audio(self, audio_samples):
-        if self.backend == "groq":
-            return self.transcribe_groq(audio_samples)
-        if self.backend == "groq_hybrid":
-            return self.transcribe_groq_hybrid(audio_samples)
-        if self.backend == "google":
-            return self.transcribe_google(audio_samples)
-        if self.backend == "faster_whisper":
-            return self.transcribe_faster_whisper(audio_samples)
-        return self.transcribe_whisper(audio_samples)
+        return self.backend_adapter.transcribe(
+            audio_samples,
+            language=self.selected_language(),
+        )
 
     def minimum_audio_seconds(self):
-        if self.backend in {"groq", "groq_hybrid"}:
-            return GROQ_MIN_AUDIO_SECONDS
-        if self.backend == "google":
-            return GOOGLE_MIN_AUDIO_SECONDS
-        return WHISPER_MIN_AUDIO_SECONDS
+        return self.backend_adapter.minimum_audio_seconds
 
     def online_request_interval(self):
-        if self.backend in {"groq", "groq_hybrid"}:
-            return GROQ_TRANSCRIPTION_INTERVAL
-        return GOOGLE_TRANSCRIPTION_INTERVAL
+        if self.backend_adapter.online:
+            return self.backend_adapter.request_interval
+        return 0.0
 
     def local_request_interval(self):
-        if self.backend in {"whisper", "faster_whisper"}:
-            return WHISPER_TRANSCRIPTION_INTERVAL
+        if not self.backend_adapter.online:
+            return self.backend_adapter.request_interval
         return 0.0
 
     def maximum_audio_seconds(self):
-        if self.backend in {"groq", "groq_hybrid"}:
-            return max(1.0, GROQ_MAX_AUDIO_SECONDS)
-        if self.backend == "google":
-            return max(1.0, GOOGLE_MAX_AUDIO_SECONDS)
-        return max(1.0, WHISPER_MAX_AUDIO_SECONDS)
-
-    def transcribe_whisper(self, audio_samples):
-        full_audio = audio_samples.astype(np.float32) / 32768.0
-        started = time.perf_counter()
-        result = self.model.transcribe(
-            full_audio,
-            fp16=DEVICE.startswith("cuda"),
-            task="translate",
-            language=self.selected_language(),
-            beam_size=WHISPER_BEAM_SIZE,
-            best_of=WHISPER_BEST_OF,
-            temperature=WHISPER_TEMPERATURE,
-            condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
-        )
-        elapsed = time.perf_counter() - started
-        if WHISPER_LOG_LATENCY:
-            print(f"\n[WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-
-        segments = result.get("segments", [])
-        if segments:
-            return " ".join(s["text"].strip() for s in segments if s["text"].strip())
-        return result["text"].strip()
-
-    def transcribe_faster_whisper(self, audio_samples):
-        full_audio = audio_samples.astype(np.float32) / 32768.0
-        started = time.perf_counter()
-        segments, _ = self.model.transcribe(
-            full_audio,
-            task="translate",
-            language=self.selected_language(),
-            beam_size=WHISPER_BEAM_SIZE,
-            best_of=WHISPER_BEST_OF,
-            temperature=WHISPER_TEMPERATURE,
-            condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
-            vad_filter=False,
-            word_timestamps=False,
-        )
-        segments = list(segments)
-        elapsed = time.perf_counter() - started
-        if WHISPER_LOG_LATENCY:
-            print(f"\n[FASTER-WHISPER LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-        return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-
-    @staticmethod
-    def raise_for_retryable_http_response(response, operation):
-        if response.status_code == 429:
-            raise RetryableTranscriptionError(
-                f"{operation} was rate-limited by Groq (HTTP 429)",
-                retry_after=retry_after_seconds(response.headers),
-            )
-        if response.status_code in {408, 409, 425} or response.status_code >= 500:
-            raise RetryableTranscriptionError(
-                f"{operation} is temporarily unavailable (HTTP {response.status_code})",
-                retry_after=retry_after_seconds(response.headers),
-            )
-
-    def transcribe_groq(self, audio_samples):
-        wav_bytes = self.encode_wav(audio_samples)
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
-        data = {
-            "model": GROQ_MODEL,
-            "response_format": GROQ_RESPONSE_FORMAT,
-            "temperature": "0",
-        }
-        if GROQ_TRANSLATION_PROMPT:
-            data["prompt"] = GROQ_TRANSLATION_PROMPT
-
-        try:
-            started = time.perf_counter()
-            response = self.http.post(
-                GROQ_TRANSLATIONS_ENDPOINT,
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=GROQ_REQUEST_TIMEOUT
-            )
-            elapsed = time.perf_counter() - started
-            if GROQ_LOG_LATENCY:
-                print(f"\n[GROQ LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-            self.raise_for_retryable_http_response(response, "Groq transcription")
-            if response.status_code >= 400:
-                if response.status_code == 400 and "does not support `translate`" in response.text:
-                    raise RuntimeError(
-                        "Groq audio translation requires "
-                        "GROQ_TRANSCRIPTION_MODEL=whisper-large-v3"
-                    )
-                raise RuntimeError(
-                    f"Groq transcription rejected the request (HTTP {response.status_code}): "
-                    f"{response.text[:160]}"
-                )
-            if GROQ_RESPONSE_FORMAT == "text":
-                text = response.text.strip()
-            else:
-                text = response.json().get("text", "").strip()
-            return self.ensure_english_prompt_text(text)
-        except requests.RequestException as exc:
-            raise RetryableTranscriptionError(
-                f"Groq transcription request failed: {exc}"
-            ) from exc
-
-    def transcribe_groq_hybrid(self, audio_samples):
-        wav_bytes = self.encode_wav(audio_samples)
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
-        data = {
-            "model": GROQ_HYBRID_MODEL,
-            "response_format": GROQ_RESPONSE_FORMAT,
-            "temperature": "0",
-        }
-        language = self.selected_language()
-        if language:
-            data["language"] = language
-
-        try:
-            started = time.perf_counter()
-            response = self.http.post(
-                GROQ_TRANSCRIPTIONS_ENDPOINT,
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=GROQ_REQUEST_TIMEOUT
-            )
-            elapsed = time.perf_counter() - started
-            if GROQ_LOG_LATENCY:
-                print(f"\n[GROQ HYBRID LATENCY]: {elapsed:.2f}s for {len(audio_samples) / RATE:.1f}s audio")
-            self.raise_for_retryable_http_response(response, "Groq hybrid transcription")
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Groq hybrid transcription rejected the request (HTTP {response.status_code}): "
-                    f"{response.text[:160]}"
-                )
-            if GROQ_RESPONSE_FORMAT == "text":
-                text = response.text.strip()
-            else:
-                text = response.json().get("text", "").strip()
-            return self.ensure_local_english_prompt_text(text)
-        except requests.RequestException as exc:
-            raise RetryableTranscriptionError(
-                f"Groq hybrid transcription request failed: {exc}"
-            ) from exc
-
-    def ensure_english_prompt_text(self, text):
-        if not text:
-            return ""
-        if GROQ_ENGLISH_FALLBACK == "off":
-            return text
-        if GROQ_ENGLISH_FALLBACK == "always" or self.contains_cjk(text):
-            translated = self.translate_text_to_english(text)
-            return translated or text
-        return text
-
-    def contains_cjk(self, text):
-        return any(
-            "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff"
-            for char in text
-        )
-
-    def translate_text_to_english(self, text):
-        payload = {
-            "model": GROQ_TEXT_TRANSLATION_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a translation engine. Translate the user's text completely into natural concise "
-                        "English for a visual generation prompt. Output only English text. Do not include any "
-                        "Chinese characters."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0,
-            "max_tokens": 120,
-        }
-
-        try:
-            started = time.perf_counter()
-            response = self.http.post(
-                GROQ_CHAT_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=GROQ_REQUEST_TIMEOUT,
-            )
-            elapsed = time.perf_counter() - started
-            self.raise_for_retryable_http_response(response, "Groq text translation")
-            if response.status_code >= 400:
-                print(f"\n[GROQ TEXT TRANSLATION ERROR]: HTTP {response.status_code} {response.text[:160]}")
-                return ""
-            translation = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            if GROQ_LOG_LATENCY:
-                print(f"\n[GROQ TEXT TRANSLATION]: {elapsed:.2f}s")
-            return translation
-        except requests.RequestException as exc:
-            raise RetryableTranscriptionError(
-                f"Groq text translation request failed: {exc}"
-            ) from exc
-
-    def initialize_local_translator(self):
-        if LOCAL_TRANSLATOR in {"none", "off"}:
-            print("[LOCAL TRANSLATOR]: Disabled. Non-English text will pass through.")
-            return
-        if LOCAL_TRANSLATOR != "argos":
-            print(f"[LOCAL TRANSLATOR]: Unknown translator '{LOCAL_TRANSLATOR}'. Non-English text will pass through.")
-            return
-        try:
-            import argostranslate.package as argos_package
-            import argostranslate.translate as argos_translate
-        except ImportError:
-            print("[LOCAL TRANSLATOR]: Argos Translate is not installed. Run: pip install argostranslate langdetect")
-            return
-        except Exception as e:
-            print(f"[LOCAL TRANSLATOR]: Argos Translate could not load: {e}")
-            print("[LOCAL TRANSLATOR]: Non-English hybrid transcripts will pass through untranslated.")
-            return
-
-        self.argos_package = argos_package
-        self.argos_translate = argos_translate
-        for source_code in LOCAL_TRANSLATOR_PRELOAD_LANGUAGES:
-            self.get_argos_translation(source_code)
-
-    def ensure_local_english_prompt_text(self, text):
-        if not text:
-            return ""
-        source_language = self.detect_text_language(text)
-        if not source_language or source_language == LOCAL_TRANSLATOR_TARGET_LANGUAGE:
-            return text
-        translated = self.translate_text_locally(text, source_language)
-        if translated and not self.contains_cjk(translated):
-            return translated
-        if HYBRID_TRANSLATION_FALLBACK == "groq_text":
-            fallback = self.translate_text_to_english(text)
-            if fallback:
-                return fallback
-        return translated or text
-
-    def detect_text_language(self, text):
-        language = self.selected_language()
-        if language:
-            return self.normalize_language_code(language)
-        if self.contains_cjk(text):
-            return "zh"
-        if detect_language is not None and len(text.strip()) >= 8:
-            try:
-                return self.normalize_language_code(detect_language(text))
-            except LangDetectException:
-                pass
-        if self.looks_like_english(text):
-            return "en"
-        return LOCAL_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE
-
-    def normalize_language_code(self, language_code):
-        code = (language_code or "").lower()
-        if code.startswith("zh"):
-            return "zh"
-        if code.startswith("es"):
-            return "es"
-        if code.startswith("en"):
-            return "en"
-        return code
-
-    def looks_like_english(self, text):
-        letters = [char for char in text if char.isalpha()]
-        if not letters:
-            return True
-        ascii_letters = [char for char in letters if "a" <= char.lower() <= "z"]
-        return len(ascii_letters) / len(letters) > 0.85
-
-    def translate_text_locally(self, text, source_language):
-        if LOCAL_TRANSLATOR != "argos":
-            return ""
-        translation = self.get_argos_translation(source_language)
-        if translation is None:
-            return ""
-        try:
-            started = time.perf_counter()
-            translated = translation.translate(text).strip()
-            elapsed = time.perf_counter() - started
-            if LOCAL_TRANSLATOR_LOG_LATENCY:
-                print(f"\n[LOCAL TRANSLATION]: {source_language}->en {elapsed:.2f}s")
-            return translated
-        except Exception as e:
-            print(f"\n[LOCAL TRANSLATION ERROR]: {e}")
-            return ""
-
-    def get_argos_translation(self, source_language):
-        source_language = self.normalize_language_code(source_language)
-        cache_key = (source_language, LOCAL_TRANSLATOR_TARGET_LANGUAGE)
-        if cache_key in self.local_translation_cache:
-            return self.local_translation_cache[cache_key]
-        if self.argos_translate is None:
-            return None
-
-        translation = self.find_argos_translation(source_language)
-        if translation is None and LOCAL_TRANSLATOR_AUTO_INSTALL:
-            self.install_argos_package(source_language)
-            translation = self.find_argos_translation(source_language)
-
-        if translation is None:
-            print(f"\n[LOCAL TRANSLATION]: No Argos package for {source_language}->en. Text will pass through.")
-        self.local_translation_cache[cache_key] = translation
-        return translation
-
-    def find_argos_translation(self, source_language):
-        installed_languages = self.argos_translate.get_installed_languages()
-        from_language = next((lang for lang in installed_languages if lang.code == source_language), None)
-        to_language = next((lang for lang in installed_languages if lang.code == LOCAL_TRANSLATOR_TARGET_LANGUAGE), None)
-        if not from_language or not to_language:
-            return None
-        try:
-            return from_language.get_translation(to_language)
-        except Exception:
-            return None
-
-    def install_argos_package(self, source_language):
-        if self.argos_package is None:
-            return
-        try:
-            print(f"\n[LOCAL TRANSLATION]: Installing Argos package {source_language}->en...")
-            self.argos_package.update_package_index()
-            available_packages = self.argos_package.get_available_packages()
-            package = next(
-                (
-                    pkg for pkg in available_packages
-                    if pkg.from_code == source_language and pkg.to_code == LOCAL_TRANSLATOR_TARGET_LANGUAGE
-                ),
-                None
-            )
-            if package is None:
-                print(f"\n[LOCAL TRANSLATION]: No downloadable Argos package for {source_language}->en.")
-                return
-            download_path = package.download()
-            self.argos_package.install_from_path(download_path)
-        except Exception as e:
-            print(f"\n[LOCAL TRANSLATION ERROR]: Could not install {source_language}->en package: {e}")
-
-    def encode_wav(self, audio_samples):
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(CHANNELS)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(RATE)
-            wav_file.writeframes(audio_samples.astype(np.int16).tobytes())
-        buffer.seek(0)
-        return buffer.read()
-
-    def transcribe_google(self, audio_samples):
-        audio_data = sr.AudioData(audio_samples.astype(np.int16).tobytes(), RATE, 2)
-        language = self.google_language()
-
-        try:
-            return self.online_recognizer.recognize_google(audio_data, language=language).strip()
-        except sr.UnknownValueError:
-            return ""
-        except sr.RequestError as e:
-            raise RetryableTranscriptionError(f"Google transcription request failed: {e}") from e
-
-    def google_language(self):
-        language = self.selected_language()
-        if language:
-            return GOOGLE_LANGUAGE_MAP.get(language, language)
-        return GOOGLE_SPEECH_LANGUAGE
+        return self.backend_adapter.maximum_audio_seconds
 
     def benchmark(self, wav_path, runs=3):
         if self.backend not in {"whisper", "faster_whisper"}:
@@ -1405,9 +881,20 @@ class RealTimePipeline:
 
         print("\n" + "=" * 50)
         print(f"LOCAL ASR BENCHMARK: {self.backend}")
-        print(f"Model: {MODEL_SIZE} | Device: {DEVICE} | Audio: {audio_seconds:.2f}s")
+        device = getattr(
+            self.backend_adapter,
+            "device",
+            self.config.whisper_device or "auto",
+        )
+        print(
+            f"Model: {self.config.whisper_model_size} | "
+            f"Device: {device} | Audio: {audio_seconds:.2f}s"
+        )
         if self.backend == "faster_whisper":
-            print(f"Compute type: {FASTER_WHISPER_COMPUTE_TYPE}")
+            print(
+                "Compute type: "
+                f"{self.config.faster_whisper_compute_type}"
+            )
         print("Warming up...")
         self.transcribe_audio(warmup)
 
@@ -1533,7 +1020,10 @@ class RealTimePipeline:
             if self.backend == "groq":
                 print("  [ONLINE] Groq translates detected speech to English automatically")
             if self.backend == "google":
-                print(f"  [ONLINE] Auto/default language -> {GOOGLE_SPEECH_LANGUAGE}")
+                print(
+                    "  [ONLINE] Auto/default language -> "
+                    f"{self.config.google_speech_language}"
+                )
             print("  Ctrl+C   -> Exit")
             print("="*50 + "\n")
             self.send_runtime_status(force=True)
@@ -1559,6 +1049,13 @@ class RealTimePipeline:
             t2.join(timeout=2.0)
             if self.osc_control_server is not None:
                 self.osc_control_server.stop()
+            self.close()
+
+    def close(self):
+        if self._backend_closed:
+            return
+        self._backend_closed = True
+        self.backend_adapter.close()
 
 if __name__ == "__main__":
     if ARGS.check_config:
@@ -1574,7 +1071,7 @@ if __name__ == "__main__":
                 config=CONFIG,
                 sample_rate=RATE,
                 chunk_size=CHUNK,
-                device=DEVICE,
+                device=CONFIG.whisper_device or "cuda",
             )
         )
 
@@ -1585,7 +1082,10 @@ if __name__ == "__main__":
         enable_osc_controls=not bool(ARGS.benchmark),
         config=CONFIG,
     )
-    if ARGS.benchmark:
-        pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
-    else:
-        pipeline.start()
+    try:
+        if ARGS.benchmark:
+            pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
+        else:
+            pipeline.start()
+    finally:
+        pipeline.close()
