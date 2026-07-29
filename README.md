@@ -18,6 +18,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
+- **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
@@ -321,7 +322,8 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 
 ## Runtime Structure
 
-- `transcriber.py` coordinates model selection, live transcription, prompt generation, and process lifecycle.
+- `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, and process lifecycle.
+- `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.

@@ -8,6 +8,7 @@ from importlib import metadata
 from pathlib import Path
 
 from audio_runtime import get_audio_input_device
+from transcription_backends import required_modules_for_backend
 
 
 @dataclass(frozen=True)
@@ -125,16 +126,26 @@ def _cuda_results(device, required):
 
 
 def _package_results(backend):
+    required_modules = required_modules_for_backend(backend)
     packages = {
         "python-osc": ("pythonosc", True),
         "PyAudio": ("pyaudio", True),
         "Silero VAD": ("silero_vad", False),
         "Transformers": ("transformers", False),
-        "OpenAI Whisper": ("whisper", backend == "whisper"),
-        "faster-whisper": ("faster_whisper", backend == "faster_whisper"),
-        "CTranslate2": ("ctranslate2", backend == "faster_whisper"),
-        "SpeechRecognition": ("speech_recognition", backend == "google"),
-        "Argos Translate": ("argostranslate", backend == "groq_hybrid"),
+        "OpenAI Whisper": ("whisper", "whisper" in required_modules),
+        "faster-whisper": (
+            "faster_whisper",
+            "faster_whisper" in required_modules,
+        ),
+        "CTranslate2": ("ctranslate2", "ctranslate2" in required_modules),
+        "SpeechRecognition": (
+            "speech_recognition",
+            "speech_recognition" in required_modules,
+        ),
+        "Argos Translate": (
+            "argostranslate",
+            "argostranslate" in required_modules,
+        ),
     }
     results = []
     for label, (module, required) in packages.items():
