@@ -29,9 +29,6 @@ from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
 from transcription_backends import create_transcription_backend
 
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-
 try:
     import pyaudio
 except ImportError:
@@ -92,44 +89,17 @@ def parse_args(args=None):
     return parser.parse_args(args)
 
 
-load_env_file()
-ARGS = parse_args() if __name__ == "__main__" else parse_args([])
-
-# --- Configuration ---
-try:
-    CONFIG = RuntimeConfig.from_environment(
-        backend_override=ARGS.backend,
-        input_device_override=ARGS.input_device,
+def load_runtime_config(args=None):
+    load_env_file()
+    return RuntimeConfig.from_environment(
+        backend_override=getattr(args, "backend", None),
+        input_device_override=getattr(args, "input_device", None),
     )
-except ConfigError as exc:
-    if __name__ == "__main__":
-        print(format_config_error(exc))
-        raise SystemExit(2)
-    raise
 
-SCENE_MEMORY_MAX_WORDS = CONFIG.scene_memory_max_words
-SCENE_MEMORY_MAX_AGE_SECONDS = CONFIG.scene_memory_max_age_seconds
-PROMPT_TOKEN_BUDGET_ENABLED = CONFIG.prompt_token_budget_enabled
-PROMPT_MAX_TOKENS = CONFIG.prompt_max_tokens
-PROMPT_MIN_TRANSCRIPT_TOKENS = CONFIG.prompt_min_transcript_tokens
-PROMPT_LOG_TOKENS = CONFIG.prompt_log_tokens
-PROMPT_TOKENIZER_MODELS = list(CONFIG.prompt_tokenizer_models)
 
-OSC_IP = CONFIG.osc_ip
-OSC_PORT = CONFIG.osc_port
-OSC_CONTROL_ENABLED = CONFIG.osc_control_enabled
-OSC_CONTROL_IP = CONFIG.osc_control_ip
-OSC_CONTROL_PORT = CONFIG.osc_control_port
-OSC_STATUS_INTERVAL = CONFIG.osc_status_interval
-
-TRANSCRIPTION_MAX_FINAL_JOBS = CONFIG.transcription_max_final_jobs
-TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS = (
-    CONFIG.transcription_partial_max_age_seconds
-)
-TRANSCRIPTION_FINAL_MAX_AGE_SECONDS = CONFIG.transcription_final_max_age_seconds
-TRANSCRIPTION_FINAL_MAX_RETRIES = CONFIG.transcription_final_max_retries
-TRANSCRIPTION_RETRY_BASE_SECONDS = CONFIG.transcription_retry_base_seconds
-TRANSCRIPTION_RETRY_MAX_SECONDS = CONFIG.transcription_retry_max_seconds
+def configure_dependency_environment():
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # --- FIXED PROMPT STRATEGY ---
 # GENDER MODES: Press 'm' for Man, 'w' for Woman, 'n' for Neutral (General)
@@ -217,19 +187,6 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16 if pyaudio is not None else None
 CHANNELS = 1
 RATE = 16000
-AUDIO_INPUT_DEVICE_INDEX = CONFIG.audio_input_device_index
-VAD_ENGINE = CONFIG.vad_engine
-VAD_THRESHOLD = CONFIG.vad_threshold
-VAD_ENERGY_THRESHOLD = CONFIG.vad_energy_threshold
-VAD_PRE_ROLL_SECONDS = CONFIG.vad_pre_roll_seconds
-VAD_SILENCE_SECONDS = CONFIG.vad_silence_seconds
-STREAM_OVERLAP_SECONDS = CONFIG.stream_overlap_seconds
-TRANSCRIPT_CONFIRM_UPDATES = CONFIG.transcript_confirm_updates
-AUDIO_RECONNECT_ENABLED = CONFIG.audio_reconnect_enabled
-AUDIO_RECONNECT_BASE_SECONDS = CONFIG.audio_reconnect_base_seconds
-AUDIO_RECONNECT_MAX_SECONDS = CONFIG.audio_reconnect_max_seconds
-AUDIO_MAX_CONSECUTIVE_READ_ERRORS = CONFIG.audio_max_consecutive_read_errors
-AUDIO_READ_RETRY_SECONDS = CONFIG.audio_read_retry_seconds
 
 
 def print_audio_input_devices():
@@ -275,7 +232,10 @@ class RealTimePipeline:
         config=None,
         backend_adapter=None,
     ):
-        self.config = config or CONFIG
+        configure_dependency_environment()
+        self.config = (
+            config if config is not None else load_runtime_config()
+        )
         self.backend_adapter = (
             backend_adapter
             if backend_adapter is not None
@@ -290,27 +250,46 @@ class RealTimePipeline:
         self.last_whisper_request_time = 0
         self.backend_retry_not_before = 0.0
 
-        self.osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT) if enable_osc else None
-        self.osc_control_enabled = bool(enable_osc_controls and OSC_CONTROL_ENABLED)
+        self.osc_client = (
+            udp_client.SimpleUDPClient(
+                self.config.osc_ip,
+                self.config.osc_port,
+            )
+            if enable_osc
+            else None
+        )
+        self.osc_control_enabled = bool(
+            enable_osc_controls and self.config.osc_control_enabled
+        )
         self.osc_control_server = None
         self.vad = self.create_voice_activity_detector() if enable_vad else None
         self.segmenter = AudioSegmenter(
             sample_rate=RATE,
             chunk_samples=CHUNK,
-            pre_roll_seconds=VAD_PRE_ROLL_SECONDS,
-            end_silence_seconds=VAD_SILENCE_SECONDS,
+            pre_roll_seconds=self.config.vad_pre_roll_seconds,
+            end_silence_seconds=self.config.vad_silence_seconds,
             max_segment_seconds=self.maximum_audio_seconds(),
-            overlap_seconds=max(0.0, min(STREAM_OVERLAP_SECONDS, self.maximum_audio_seconds() / 2)),
+            overlap_seconds=max(
+                0.0,
+                min(
+                    self.config.stream_overlap_seconds,
+                    self.maximum_audio_seconds() / 2,
+                ),
+            ),
         )
         self.scheduler = RealtimeJobScheduler(
-            max_final_jobs=TRANSCRIPTION_MAX_FINAL_JOBS,
-            partial_max_age_seconds=TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS,
-            final_max_age_seconds=TRANSCRIPTION_FINAL_MAX_AGE_SECONDS,
+            max_final_jobs=self.config.transcription_max_final_jobs,
+            partial_max_age_seconds=(
+                self.config.transcription_partial_max_age_seconds
+            ),
+            final_max_age_seconds=(
+                self.config.transcription_final_max_age_seconds
+            ),
         )
         self.stabilizers = {}
         self.scene_memory = RollingSceneMemory(
-            max_words=SCENE_MEMORY_MAX_WORDS,
-            max_age_seconds=SCENE_MEMORY_MAX_AGE_SECONDS,
+            max_words=self.config.scene_memory_max_words,
+            max_age_seconds=self.config.scene_memory_max_age_seconds,
         )
         self.prompt_budgeter = self.create_prompt_budgeter() if enable_prompt_budget else None
         self.last_prompt_token_count = 0
@@ -344,39 +323,58 @@ class RealTimePipeline:
         self.osc_lock = threading.Lock()
 
     def create_prompt_budgeter(self):
-        if not PROMPT_TOKEN_BUDGET_ENABLED:
+        if not self.config.prompt_token_budget_enabled:
             print("Prompt token budgeting is disabled.")
             return None
         try:
             from transformers import AutoTokenizer
 
-            tokenizers = [AutoTokenizer.from_pretrained(model) for model in PROMPT_TOKENIZER_MODELS]
+            tokenizers = [
+                AutoTokenizer.from_pretrained(model)
+                for model in self.config.prompt_tokenizer_models
+            ]
             print(
                 f"Using {len(tokenizers)} SDXL CLIP tokenizer(s) "
-                f"with a {PROMPT_MAX_TOKENS}-token prompt limit."
+                f"with a {self.config.prompt_max_tokens}-token prompt limit."
             )
             return PromptBudgeter(
                 tokenizers,
-                max_tokens=PROMPT_MAX_TOKENS,
-                min_transcript_tokens=PROMPT_MIN_TRANSCRIPT_TOKENS,
+                max_tokens=self.config.prompt_max_tokens,
+                min_transcript_tokens=(
+                    self.config.prompt_min_transcript_tokens
+                ),
             )
         except Exception as exc:
             print(f"[PROMPT BUDGET]: Tokenizers unavailable ({exc}). Prompts will not be token-limited.")
             return None
 
     def create_voice_activity_detector(self):
-        if VAD_ENGINE == "silero":
+        if self.config.vad_engine == "silero":
             try:
-                detector = SileroVoiceActivityDetector(VAD_THRESHOLD, sample_rate=RATE)
-                print(f"Using Silero VAD on CPU (threshold {VAD_THRESHOLD:.2f}).")
+                detector = SileroVoiceActivityDetector(
+                    self.config.vad_threshold,
+                    sample_rate=RATE,
+                )
+                print(
+                    "Using Silero VAD on CPU "
+                    f"(threshold {self.config.vad_threshold:.2f})."
+                )
                 return detector
             except Exception as exc:
                 print(f"[VAD]: Silero unavailable ({exc}). Falling back to energy detection.")
-        elif VAD_ENGINE != "energy":
-            print(f"[VAD]: Unknown engine '{VAD_ENGINE}'. Falling back to energy detection.")
+        elif self.config.vad_engine != "energy":
+            print(
+                f"[VAD]: Unknown engine '{self.config.vad_engine}'. "
+                "Falling back to energy detection."
+            )
 
-        print(f"Using energy VAD (threshold {VAD_ENERGY_THRESHOLD:.0f}).")
-        return EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+        print(
+            "Using energy VAD "
+            f"(threshold {self.config.vad_energy_threshold:.0f})."
+        )
+        return EnergyVoiceActivityDetector(
+            self.config.vad_energy_threshold
+        )
 
     def create_audio_interface(self):
         if pyaudio is None:
@@ -387,7 +385,10 @@ class RealTimePipeline:
         return pyaudio.PyAudio()
 
     def open_microphone_stream(self, audio_interface):
-        device = get_audio_input_device(audio_interface, AUDIO_INPUT_DEVICE_INDEX)
+        device = get_audio_input_device(
+            audio_interface,
+            self.config.audio_input_device_index,
+        )
         self.audio_device_index = device.index
         self.audio_device_name = device.name
         return audio_interface.open(
@@ -405,7 +406,9 @@ class RealTimePipeline:
             is_speech = self.vad.is_speech(audio_data)
         except Exception as exc:
             print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
-            self.vad = EnergyVoiceActivityDetector(VAD_ENERGY_THRESHOLD)
+            self.vad = EnergyVoiceActivityDetector(
+                self.config.vad_energy_threshold
+            )
             is_speech = self.vad.is_speech(audio_data)
 
         with self.lock:
@@ -492,17 +495,22 @@ class RealTimePipeline:
                         self.is_speaking = False
                         self.send_runtime_status(force=True)
 
-                        if consecutive_read_errors >= AUDIO_MAX_CONSECUTIVE_READ_ERRORS:
+                        max_read_errors = (
+                            self.config.audio_max_consecutive_read_errors
+                        )
+                        if consecutive_read_errors >= max_read_errors:
                             raise RuntimeError(
                                 f"microphone read failed {consecutive_read_errors} consecutive times: {exc}"
                             ) from exc
 
                         print(
                             f"\n[AUDIO READ ERROR]: {exc} "
-                            f"({consecutive_read_errors}/{AUDIO_MAX_CONSECUTIVE_READ_ERRORS}); "
+                            f"({consecutive_read_errors}/{max_read_errors}); "
                             "retrying the current stream."
                         )
-                        if not self.wait_for_audio_retry(AUDIO_READ_RETRY_SECONDS):
+                        if not self.wait_for_audio_retry(
+                            self.config.audio_read_retry_seconds
+                        ):
                             break
                         continue
 
@@ -529,7 +537,7 @@ class RealTimePipeline:
                 self.finalize_interrupted_audio()
             self.is_speaking = False
             self.last_audio_error = self.clean_audio_error(failure)
-            if not AUDIO_RECONNECT_ENABLED:
+            if not self.config.audio_reconnect_enabled:
                 self.audio_status = "error"
                 self.is_running = False
                 print(f"\n[AUDIO ERROR]: {failure}. Automatic reconnection is disabled.")
@@ -538,8 +546,8 @@ class RealTimePipeline:
 
             retry_delay = exponential_backoff(
                 reconnect_attempt,
-                base_seconds=AUDIO_RECONNECT_BASE_SECONDS,
-                max_seconds=AUDIO_RECONNECT_MAX_SECONDS,
+                base_seconds=self.config.audio_reconnect_base_seconds,
+                max_seconds=self.config.audio_reconnect_max_seconds,
             )
             reconnect_attempt += 1
             self.audio_reconnects += 1
@@ -609,7 +617,9 @@ class RealTimePipeline:
 
             stabilizer = self.stabilizers.setdefault(
                 job.segment.segment_id,
-                TranscriptStabilizer(TRANSCRIPT_CONFIRM_UPDATES),
+                TranscriptStabilizer(
+                    self.config.transcript_confirm_updates
+                ),
             )
             update = stabilizer.update(text, is_final=job.is_final)
             scene_text = ""
@@ -649,20 +659,26 @@ class RealTimePipeline:
         if retry_delay is None:
             retry_delay = exponential_backoff(
                 job.attempts,
-                base_seconds=TRANSCRIPTION_RETRY_BASE_SECONDS,
-                max_seconds=TRANSCRIPTION_RETRY_MAX_SECONDS,
+                base_seconds=(
+                    self.config.transcription_retry_base_seconds
+                ),
+                max_seconds=(
+                    self.config.transcription_retry_max_seconds
+                ),
             )
         self.backend_retry_not_before = max(
             self.backend_retry_not_before,
             now + retry_delay,
         )
 
-        should_retry = job.is_final and job.attempts < TRANSCRIPTION_FINAL_MAX_RETRIES
+        max_retries = self.config.transcription_final_max_retries
+        should_retry = job.is_final and job.attempts < max_retries
         if should_retry and self.scheduler.retry_final(job, now, retry_delay):
             self.backend_status = "retrying"
             print(
                 f"\n[TRANSCRIPTION RETRY]: Final segment {job.segment.segment_id} "
-                f"in {retry_delay:.1f}s ({job.attempts + 1}/{TRANSCRIPTION_FINAL_MAX_RETRIES})."
+                f"in {retry_delay:.1f}s "
+                f"({job.attempts + 1}/{max_retries})."
             )
         else:
             self.scheduler.mark_failed()
@@ -692,7 +708,11 @@ class RealTimePipeline:
             current_prompt_style = self.current_prompt_style
             current_language = self.current_language or "auto"
         with self.osc_lock:
-            if not force and now - self.last_status_osc_time < OSC_STATUS_INTERVAL:
+            if (
+                not force
+                and now - self.last_status_osc_time
+                < self.config.osc_status_interval
+            ):
                 return
             metrics = self.scheduler.metrics(now)
             self.osc_client.send_message("/backend_status", self.backend_status)
@@ -840,10 +860,11 @@ class RealTimePipeline:
         self.last_prompt_token_count = result.token_count
         self.last_prompt_variant = result.variant
         self.last_prompt_trimmed = result.transcript_trimmed
-        if PROMPT_LOG_TOKENS:
+        if self.config.prompt_log_tokens:
             trimmed = ", newest transcript retained" if result.transcript_trimmed else ""
             print(
-                f"\n[PROMPT TOKENS]: {result.token_count}/{PROMPT_MAX_TOKENS} "
+                f"\n[PROMPT TOKENS]: {result.token_count}/"
+                f"{self.config.prompt_max_tokens} "
                 f"({result.variant}{trimmed})"
             )
         return result.text
@@ -939,14 +960,18 @@ class RealTimePipeline:
         if not self.osc_control_enabled:
             return
         server = OscControlServer(
-            OSC_CONTROL_IP,
-            OSC_CONTROL_PORT,
+            self.config.osc_control_ip,
+            self.config.osc_control_port,
             self.apply_control,
         )
         try:
             address = server.start()
         except OSError as exc:
-            print(f"[OSC CONTROL]: Could not bind {OSC_CONTROL_IP}:{OSC_CONTROL_PORT} ({exc}).")
+            print(
+                "[OSC CONTROL]: Could not bind "
+                f"{self.config.osc_control_ip}:"
+                f"{self.config.osc_control_port} ({exc})."
+            )
             return
         self.osc_control_server = server
         print(f"[OSC CONTROL]: Listening on {address[0]}:{address[1]}.")
@@ -1008,7 +1033,11 @@ class RealTimePipeline:
         
         try:
             print("\n" + "="*50)
-            print(f"BACKEND: {self.backend} | VAD: {VAD_ENGINE} | CONFIRMATIONS: {TRANSCRIPT_CONFIRM_UPDATES}")
+            print(
+                f"BACKEND: {self.backend} | "
+                f"VAD: {self.config.vad_engine} | "
+                f"CONFIRMATIONS: {self.config.transcript_confirm_updates}"
+            )
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
@@ -1016,7 +1045,11 @@ class RealTimePipeline:
             print("  [PROMPT] 'f' -> Human figure focus | 'g' -> General scene")
             print("  [LANG]   'e' -> English | 'c' -> Chinese | 's' -> Spanish | 'a' -> Auto")
             if self.osc_control_server is not None:
-                print(f"  [OSC IN] {OSC_CONTROL_IP}:{OSC_CONTROL_PORT} for TouchDesigner controls")
+                print(
+                    f"  [OSC IN] {self.config.osc_control_ip}:"
+                    f"{self.config.osc_control_port} "
+                    "for TouchDesigner controls"
+                )
             if self.backend == "groq":
                 print("  [ONLINE] Groq translates detected speech to English automatically")
             if self.backend == "google":
@@ -1057,35 +1090,46 @@ class RealTimePipeline:
         self._backend_closed = True
         self.backend_adapter.close()
 
-if __name__ == "__main__":
-    if ARGS.check_config:
-        print(format_config_report(CONFIG))
-        raise SystemExit(0)
 
-    if ARGS.list_audio_devices:
-        raise SystemExit(print_audio_input_devices())
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        config = load_runtime_config(args)
+    except ConfigError as exc:
+        print(format_config_error(exc))
+        return 2
 
-    if ARGS.diagnose:
-        raise SystemExit(
-            run_diagnostics(
-                config=CONFIG,
-                sample_rate=RATE,
-                chunk_size=CHUNK,
-                device=CONFIG.whisper_device or "cuda",
-            )
+    if args.check_config:
+        print(format_config_report(config))
+        return 0
+
+    if args.list_audio_devices:
+        return print_audio_input_devices()
+
+    if args.diagnose:
+        return run_diagnostics(
+            config=config,
+            sample_rate=RATE,
+            chunk_size=CHUNK,
+            device=config.whisper_device or "cuda",
         )
 
     pipeline = RealTimePipeline(
-        enable_vad=not bool(ARGS.benchmark),
-        enable_osc=not bool(ARGS.benchmark),
-        enable_prompt_budget=not bool(ARGS.benchmark),
-        enable_osc_controls=not bool(ARGS.benchmark),
-        config=CONFIG,
+        enable_vad=not bool(args.benchmark),
+        enable_osc=not bool(args.benchmark),
+        enable_prompt_budget=not bool(args.benchmark),
+        enable_osc_controls=not bool(args.benchmark),
+        config=config,
     )
     try:
-        if ARGS.benchmark:
-            pipeline.benchmark(ARGS.benchmark, ARGS.benchmark_runs)
+        if args.benchmark:
+            pipeline.benchmark(args.benchmark, args.benchmark_runs)
         else:
             pipeline.start()
     finally:
         pipeline.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

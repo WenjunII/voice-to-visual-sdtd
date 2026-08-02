@@ -22,6 +22,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
+- **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
 - **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
 ## Tech Stack
@@ -322,7 +323,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 
 ## Runtime Structure
 
-- `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, and process lifecycle.
+- `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, and process lifecycle. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
 - `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `audio_runtime.py` owns CPU voice activity detectors.
@@ -351,7 +352,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies that multiple pipelines retain independent runtime settings and that importing `transcriber.py` does not load or validate `.env`. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 

@@ -1,12 +1,41 @@
-import threading
+import sys
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from backend_errors import RetryableTranscriptionError
 from runtime_config import RuntimeConfig
 from transcriber import RealTimePipeline, parse_args
+
+
+def make_backend_adapter(*, online=False):
+    adapter = Mock()
+    adapter.name = "google" if online else "whisper"
+    adapter.online = online
+    adapter.request_interval = 2.5
+    adapter.minimum_audio_seconds = 1.25
+    adapter.maximum_audio_seconds = 5.0
+    adapter.transcribe.return_value = "adapter transcript"
+    return adapter
+
+
+def make_pipeline(config=None, *, online=False, backend_adapter=None):
+    return RealTimePipeline(
+        enable_vad=False,
+        enable_osc=False,
+        enable_prompt_budget=False,
+        enable_osc_controls=False,
+        config=config if config is not None else RuntimeConfig(),
+        backend_adapter=(
+            backend_adapter
+            if backend_adapter is not None
+            else make_backend_adapter(online=online)
+        ),
+    )
 
 
 class CommandLineTests(unittest.TestCase):
@@ -28,35 +57,14 @@ class CommandLineTests(unittest.TestCase):
 
 class RealTimePipelineControlTests(unittest.TestCase):
     def make_pipeline(self):
-        pipeline = RealTimePipeline.__new__(RealTimePipeline)
-        pipeline.current_gender = "neutral"
-        pipeline.current_age = "adult"
-        pipeline.current_visual_mode = "asian_american"
-        pipeline.current_prompt_style = "human_focus"
-        pipeline.current_language = None
+        pipeline = make_pipeline()
         pipeline.last_text = "a city glowing after rain"
         pipeline.last_prompt_token_count = 42
         pipeline.audio_status = "ready"
-        pipeline.audio_reconnects = 0
-        pipeline.last_audio_error = ""
         pipeline.audio_device_index = 2
         pipeline.audio_device_name = "USB Microphone"
-        pipeline.state_lock = threading.Lock()
-        pipeline.scene_lock = threading.Lock()
-        pipeline.osc_lock = threading.Lock()
-        pipeline.last_status_osc_time = 0.0
-        pipeline.backend_retry_not_before = 0.0
-        pipeline.backend_status = "ready"
-        pipeline.backend = "faster_whisper"
-        pipeline.is_speaking = False
         pipeline.last_total_latency = 0.25
         pipeline.last_inference_latency = 0.2
-        pipeline.scheduler = Mock()
-        pipeline.scheduler.metrics.return_value = SimpleNamespace(
-            queue_depth=0,
-            dropped_stale=0,
-            dropped_finals=0,
-        )
         pipeline.osc_client = Mock()
         return pipeline
 
@@ -128,19 +136,9 @@ class RealTimePipelineControlTests(unittest.TestCase):
 
 class BackendAdapterIntegrationTests(unittest.TestCase):
     def make_pipeline(self, *, online=True):
-        adapter = Mock()
-        adapter.name = "google" if online else "whisper"
-        adapter.online = online
-        adapter.request_interval = 2.5
-        adapter.minimum_audio_seconds = 1.25
-        adapter.maximum_audio_seconds = 5.0
-        adapter.transcribe.return_value = "adapter transcript"
-        pipeline = RealTimePipeline(
-            enable_vad=False,
-            enable_osc=False,
-            enable_prompt_budget=False,
-            enable_osc_controls=False,
-            config=RuntimeConfig(),
+        adapter = make_backend_adapter(online=online)
+        pipeline = make_pipeline(
+            online=online,
             backend_adapter=adapter,
         )
         return pipeline, adapter
@@ -175,16 +173,194 @@ class BackendAdapterIntegrationTests(unittest.TestCase):
         adapter.close.assert_called_once_with()
 
 
+class PipelineConfigurationIsolationTests(unittest.TestCase):
+    def test_each_pipeline_configures_its_own_runtime_components(self):
+        first_config = replace(
+            RuntimeConfig(),
+            audio_input_device_index=2,
+            scene_memory_max_words=12,
+            scene_memory_max_age_seconds=8.0,
+            transcription_max_final_jobs=3,
+            transcription_partial_max_age_seconds=1.5,
+            transcription_final_max_age_seconds=9.0,
+            vad_pre_roll_seconds=0.1,
+            vad_silence_seconds=0.25,
+            stream_overlap_seconds=0.2,
+        )
+        second_config = replace(
+            RuntimeConfig(),
+            audio_input_device_index=7,
+            scene_memory_max_words=48,
+            scene_memory_max_age_seconds=30.0,
+            transcription_max_final_jobs=11,
+            transcription_partial_max_age_seconds=5.0,
+            transcription_final_max_age_seconds=45.0,
+            vad_pre_roll_seconds=0.6,
+            vad_silence_seconds=1.1,
+            stream_overlap_seconds=0.8,
+        )
+
+        first = make_pipeline(first_config)
+        second = make_pipeline(second_config)
+
+        self.assertIs(first.config, first_config)
+        self.assertIs(second.config, second_config)
+        self.assertEqual(first.audio_device_index, 2)
+        self.assertEqual(second.audio_device_index, 7)
+        self.assertEqual(first.scheduler.max_final_jobs, 3)
+        self.assertEqual(second.scheduler.max_final_jobs, 11)
+        self.assertEqual(first.scheduler.partial_max_age_seconds, 1.5)
+        self.assertEqual(second.scheduler.final_max_age_seconds, 45.0)
+        self.assertEqual(first.scene_memory.max_words, 12)
+        self.assertEqual(second.scene_memory.max_words, 48)
+        self.assertEqual(first.segmenter.end_silence_samples, 4000)
+        self.assertEqual(second.segmenter.end_silence_samples, 17600)
+        self.assertEqual(first.segmenter.overlap_chunks, 4)
+        self.assertEqual(second.segmenter.overlap_chunks, 13)
+
+    def test_each_pipeline_uses_its_own_osc_configuration(self):
+        first_config = replace(
+            RuntimeConfig(),
+            osc_ip="127.0.0.2",
+            osc_port=7100,
+            osc_control_enabled=True,
+            osc_control_ip="127.0.0.4",
+            osc_control_port=7101,
+        )
+        second_config = replace(
+            RuntimeConfig(),
+            osc_ip="127.0.0.3",
+            osc_port=7200,
+            osc_control_enabled=False,
+        )
+
+        with patch("transcriber.udp_client.SimpleUDPClient") as client:
+            first = RealTimePipeline(
+                enable_vad=False,
+                enable_osc=True,
+                enable_prompt_budget=False,
+                enable_osc_controls=True,
+                config=first_config,
+                backend_adapter=make_backend_adapter(),
+            )
+            second = RealTimePipeline(
+                enable_vad=False,
+                enable_osc=True,
+                enable_prompt_budget=False,
+                enable_osc_controls=True,
+                config=second_config,
+                backend_adapter=make_backend_adapter(),
+            )
+
+        self.assertEqual(
+            [call.args for call in client.call_args_list],
+            [("127.0.0.2", 7100), ("127.0.0.3", 7200)],
+        )
+        self.assertTrue(first.osc_control_enabled)
+        self.assertFalse(second.osc_control_enabled)
+
+        server = Mock()
+        server.start.return_value = ("127.0.0.4", 7101)
+        with (
+            patch(
+                "transcriber.OscControlServer",
+                return_value=server,
+            ) as server_type,
+            redirect_stdout(StringIO()),
+        ):
+            first.start_osc_control_server()
+            second.start_osc_control_server()
+
+        server_type.assert_called_once_with(
+            "127.0.0.4",
+            7101,
+            first.apply_control,
+        )
+
+    def test_vad_and_prompt_budgeting_use_the_pipeline_configuration(self):
+        config = replace(
+            RuntimeConfig(),
+            vad_engine="energy",
+            vad_energy_threshold=275.0,
+            prompt_tokenizer_models=("tokenizer-a", "tokenizer-b"),
+            prompt_max_tokens=61,
+            prompt_min_transcript_tokens=17,
+        )
+        auto_tokenizer = Mock()
+        auto_tokenizer.from_pretrained.side_effect = [Mock(), Mock()]
+        transformers = types.ModuleType("transformers")
+        transformers.AutoTokenizer = auto_tokenizer
+
+        with (
+            patch.dict(sys.modules, {"transformers": transformers}),
+            redirect_stdout(StringIO()),
+        ):
+            pipeline = RealTimePipeline(
+                enable_vad=True,
+                enable_osc=False,
+                enable_prompt_budget=True,
+                enable_osc_controls=False,
+                config=config,
+                backend_adapter=make_backend_adapter(),
+            )
+
+        self.assertEqual(pipeline.vad.threshold, 275.0)
+        self.assertEqual(
+            [call.args[0] for call in auto_tokenizer.from_pretrained.call_args_list],
+            ["tokenizer-a", "tokenizer-b"],
+        )
+        self.assertEqual(pipeline.prompt_budgeter.max_tokens, 61)
+        self.assertEqual(
+            pipeline.prompt_budgeter.min_transcript_tokens,
+            17,
+        )
+
+    def test_transcription_retries_use_the_pipeline_configuration(self):
+        config = replace(
+            RuntimeConfig(),
+            transcription_final_max_retries=4,
+            transcription_retry_base_seconds=2.25,
+            transcription_retry_max_seconds=7.5,
+        )
+        pipeline = make_pipeline(config)
+        pipeline.scheduler = Mock()
+        pipeline.scheduler.retry_final.return_value = True
+        pipeline.send_runtime_status = Mock()
+        job = SimpleNamespace(
+            is_final=True,
+            attempts=1,
+            segment=SimpleNamespace(segment_id=9),
+        )
+
+        with (
+            patch("transcriber.time.monotonic", return_value=20.0),
+            patch(
+                "transcriber.exponential_backoff",
+                return_value=4.5,
+            ) as backoff,
+            redirect_stdout(StringIO()),
+        ):
+            pipeline.handle_retryable_failure(
+                job,
+                RetryableTranscriptionError("temporary failure"),
+            )
+
+        backoff.assert_called_once_with(
+            1,
+            base_seconds=2.25,
+            max_seconds=7.5,
+        )
+        pipeline.scheduler.retry_final.assert_called_once_with(
+            job,
+            20.0,
+            4.5,
+        )
+        self.assertEqual(pipeline.backend_retry_not_before, 24.5)
+
+
 class MicrophoneRecoveryTests(unittest.TestCase):
-    def make_pipeline(self):
-        pipeline = RealTimePipeline.__new__(RealTimePipeline)
-        pipeline.is_running = True
-        pipeline.is_speaking = False
-        pipeline.audio_status = "starting"
-        pipeline.audio_reconnects = 0
-        pipeline.last_audio_error = ""
-        pipeline.audio_device_index = -1
-        pipeline.audio_device_name = "system default"
+    def make_pipeline(self, config=None):
+        pipeline = make_pipeline(config)
         pipeline.send_runtime_status = Mock()
         pipeline.process_audio_data = Mock()
         pipeline.finalize_interrupted_audio = Mock()
@@ -232,7 +408,12 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         recovered_stream.close.assert_called_once()
 
     def test_reopens_the_stream_after_repeated_read_failures(self):
-        pipeline = self.make_pipeline()
+        pipeline = self.make_pipeline(
+            replace(
+                RuntimeConfig(),
+                audio_max_consecutive_read_errors=2,
+            )
+        )
         first_audio = self.make_audio_interface()
         second_audio = self.make_audio_interface()
         failing_stream = Mock()
@@ -248,10 +429,7 @@ class MicrophoneRecoveryTests(unittest.TestCase):
             side_effect=[failing_stream, recovered_stream]
         )
 
-        with (
-            patch("transcriber.AUDIO_MAX_CONSECUTIVE_READ_ERRORS", 2),
-            redirect_stdout(StringIO()),
-        ):
+        with redirect_stdout(StringIO()):
             pipeline.audio_callback()
 
         self.assertEqual(pipeline.audio_reconnects, 1)
@@ -262,23 +440,26 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         recovered_stream.close.assert_called_once()
 
     def test_missing_pyaudio_has_an_actionable_runtime_error(self):
-        pipeline = RealTimePipeline.__new__(RealTimePipeline)
+        pipeline = self.make_pipeline()
 
         with patch("transcriber.pyaudio", None):
             with self.assertRaisesRegex(RuntimeError, "--diagnose"):
                 pipeline.create_audio_interface()
 
     def test_opens_the_selected_input_device(self):
-        pipeline = RealTimePipeline.__new__(RealTimePipeline)
+        pipeline = self.make_pipeline(
+            replace(RuntimeConfig(), audio_input_device_index=4)
+        )
         audio_interface = Mock()
         selected = SimpleNamespace(index=4, name="Stage USB Microphone")
 
-        with (
-            patch("transcriber.AUDIO_INPUT_DEVICE_INDEX", 4),
-            patch("transcriber.get_audio_input_device", return_value=selected),
-        ):
+        with patch(
+            "transcriber.get_audio_input_device",
+            return_value=selected,
+        ) as resolve_device:
             pipeline.open_microphone_stream(audio_interface)
 
+        resolve_device.assert_called_once_with(audio_interface, 4)
         self.assertEqual(pipeline.audio_device_index, 4)
         self.assertEqual(pipeline.audio_device_name, "Stage USB Microphone")
         self.assertEqual(

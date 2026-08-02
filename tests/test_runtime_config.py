@@ -198,6 +198,34 @@ class ConfigCommandTests(unittest.TestCase):
             check=False,
         )
 
+    def test_importing_transcriber_does_not_load_or_validate_runtime_config(self):
+        environment = self.clean_config_environment()
+        environment["OSC_PORT"] = "invalid"
+        environment.pop("TRANSFORMERS_VERBOSITY", None)
+        environment.pop("HF_HUB_DISABLE_SYMLINKS_WARNING", None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os; import transcriber; "
+                    "assert 'TRANSFORMERS_VERBOSITY' not in os.environ; "
+                    "assert 'HF_HUB_DISABLE_SYMLINKS_WARNING' not in os.environ; "
+                    "print('imported')"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "imported")
+
     def test_check_config_returns_two_for_invalid_values(self):
         environment = self.clean_config_environment()
         environment["OSC_PORT"] = "invalid"
