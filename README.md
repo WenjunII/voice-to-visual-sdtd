@@ -23,6 +23,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
+- **Structured Session Logging**: Labels operational events by subsystem, captures latency/retry/reconnection metrics, optionally rotates JSON Lines log files, and redacts configured credentials.
 - **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
 ## Tech Stack
@@ -176,6 +177,14 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     OSC_CONTROL_PORT=7001
     OSC_STATUS_INTERVAL=0.5
 
+    # Human-readable operational console logs and optional rotating JSON Lines files.
+    RUNTIME_LOG_LEVEL=info
+    RUNTIME_LOG_CONSOLE_ENABLED=true
+    # Leave blank to disable persistent logs.
+    RUNTIME_LOG_FILE=
+    RUNTIME_LOG_MAX_BYTES=5000000
+    RUNTIME_LOG_BACKUP_COUNT=3
+
     # Keep recent scene details while removing repeated overlap between segments.
     SCENE_MEMORY_MAX_WORDS=36
     SCENE_MEMORY_MAX_AGE_SECONDS=20
@@ -277,6 +286,20 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
 6.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
 
+### Runtime Logging
+
+Operational events use `debug`, `info`, `warning`, `error`, or `critical` levels and identify their subsystem, including `audio`, `backend`, `transcription`, `scheduler`, `prompt`, `osc`, and `control`. Console logs remain human-readable. Set `RUNTIME_LOG_FILE` to enable persistent JSON Lines logs:
+
+```env
+RUNTIME_LOG_LEVEL=info
+RUNTIME_LOG_CONSOLE_ENABLED=true
+RUNTIME_LOG_FILE=logs/voice-to-visual.jsonl
+RUNTIME_LOG_MAX_BYTES=5000000
+RUNTIME_LOG_BACKUP_COUNT=3
+```
+
+The file rotates before exceeding the configured size and retains the configured number of backups. Each record contains a timestamp, session ID, subsystem, event name, level, message, and relevant metrics. Raw prompt and transcript text remains in the live console instead of the operational file, and configured API keys plus bearer credentials are replaced with `<redacted>`.
+
 ### OSC Output to TouchDesigner
 
 | Address | Value |
@@ -326,6 +349,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 - `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, and process lifecycle. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
 - `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
+- `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
@@ -352,7 +376,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies that multiple pipelines retain independent runtime settings and that importing `transcriber.py` does not load or validate `.env`. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, log rotation, structured fields, and credential redaction. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 

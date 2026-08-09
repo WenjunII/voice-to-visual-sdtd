@@ -22,6 +22,9 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.transcription_backend, "whisper")
         self.assertEqual(config.osc_port, 7000)
         self.assertTrue(config.osc_control_enabled)
+        self.assertEqual(config.runtime_log_level, "info")
+        self.assertTrue(config.runtime_log_console_enabled)
+        self.assertEqual(config.runtime_log_file, "")
         self.assertEqual(config.audio_input_device_index, None)
         self.assertEqual(
             config.prompt_tokenizer_models,
@@ -80,6 +83,9 @@ class RuntimeConfigTests(unittest.TestCase):
                     "WHISPER_MAX_AUDIO_SECONDS": "4",
                     "TRANSCRIPTION_RETRY_BASE_SECONDS": "12",
                     "TRANSCRIPTION_RETRY_MAX_SECONDS": "3",
+                    "RUNTIME_LOG_LEVEL": "verbose",
+                    "RUNTIME_LOG_MAX_BYTES": "0",
+                    "RUNTIME_LOG_BACKUP_COUNT": "-1",
                 }
             )
 
@@ -93,6 +99,19 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn(
             "TRANSCRIPTION_RETRY_BASE_SECONDS must not exceed "
             "TRANSCRIPTION_RETRY_MAX_SECONDS",
+            errors,
+        )
+        self.assertIn(
+            "RUNTIME_LOG_LEVEL must be one of: "
+            "critical, debug, error, info, warning",
+            errors,
+        )
+        self.assertIn(
+            "RUNTIME_LOG_MAX_BYTES must be greater than 0",
+            errors,
+        )
+        self.assertIn(
+            "RUNTIME_LOG_BACKUP_COUNT must be greater than 0",
             errors,
         )
 
@@ -138,6 +157,12 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn("CAPRIOLE_API_KEY", report)
         self.assertIn("GROQ_API_KEY", report)
         self.assertGreaterEqual(report.count("<redacted>"), 2)
+
+    def test_report_marks_an_empty_runtime_log_file_as_disabled(self):
+        report = format_config_report(RuntimeConfig())
+
+        self.assertIn("RUNTIME_LOG_FILE", report)
+        self.assertIn("<disabled>", report)
 
     def test_error_report_never_includes_unrelated_environment_values(self):
         try:

@@ -20,6 +20,7 @@ NORMALIZED_ENV_NAMES = {
     "LOCAL_TRANSLATOR_PRELOAD_LANGUAGES",
     "HYBRID_TRANSLATION_FALLBACK",
     "VAD_ENGINE",
+    "RUNTIME_LOG_LEVEL",
 }
 
 
@@ -161,6 +162,18 @@ class RuntimeConfig:
     osc_control_ip: str = _config_field("OSC_CONTROL_IP", "127.0.0.1")
     osc_control_port: int = _config_field("OSC_CONTROL_PORT", 7001)
     osc_status_interval: float = _config_field("OSC_STATUS_INTERVAL", 0.5)
+
+    runtime_log_level: str = _config_field("RUNTIME_LOG_LEVEL", "info")
+    runtime_log_console_enabled: bool = _config_field(
+        "RUNTIME_LOG_CONSOLE_ENABLED", True
+    )
+    runtime_log_file: str = _config_field("RUNTIME_LOG_FILE", "")
+    runtime_log_max_bytes: int = _config_field(
+        "RUNTIME_LOG_MAX_BYTES", 5_000_000
+    )
+    runtime_log_backup_count: int = _config_field(
+        "RUNTIME_LOG_BACKUP_COUNT", 3
+    )
 
     transcription_max_final_jobs: int = _config_field(
         "TRANSCRIPTION_MAX_FINAL_JOBS", 8
@@ -360,6 +373,8 @@ class RuntimeConfig:
                 "FASTER_WHISPER_NUM_WORKERS": self.faster_whisper_num_workers,
                 "PROMPT_MAX_TOKENS": self.prompt_max_tokens,
                 "OSC_STATUS_INTERVAL": self.osc_status_interval,
+                "RUNTIME_LOG_MAX_BYTES": self.runtime_log_max_bytes,
+                "RUNTIME_LOG_BACKUP_COUNT": self.runtime_log_backup_count,
                 "TRANSCRIPTION_MAX_FINAL_JOBS": self.transcription_max_final_jobs,
                 "TRANSCRIPTION_RETRY_BASE_SECONDS": self.transcription_retry_base_seconds,
                 "TRANSCRIPTION_RETRY_MAX_SECONDS": self.transcription_retry_max_seconds,
@@ -402,6 +417,17 @@ class RuntimeConfig:
             errors.append("VAD_THRESHOLD must be between 0 and 1")
         if self.vad_engine not in {"silero", "energy"}:
             errors.append("VAD_ENGINE must be one of: energy, silero")
+        if self.runtime_log_level not in {
+            "debug",
+            "info",
+            "warning",
+            "error",
+            "critical",
+        }:
+            errors.append(
+                "RUNTIME_LOG_LEVEL must be one of: "
+                "critical, debug, error, info, warning"
+            )
         if self.groq_response_format not in {"json", "text", "verbose_json"}:
             errors.append(
                 "GROQ_RESPONSE_FORMAT must be one of: json, text, verbose_json"
@@ -514,6 +540,8 @@ class RuntimeConfig:
                 display = str(value).lower()
             elif isinstance(value, tuple):
                 display = ",".join(str(item) for item in value)
+            elif env_name == "RUNTIME_LOG_FILE" and value == "":
+                display = "<disabled>"
             elif value == "":
                 display = "<auto>"
             else:

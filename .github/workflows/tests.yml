@@ -41,5 +41,6 @@ jobs:
           python -m py_compile
           audio_runtime.py backend_errors.py diagnostics.py orchestrator.py
           osc_control.py prompt_engine.py runtime_config.py runtime_scheduler.py
+          runtime_logging.py
           streaming_core.py transcript_filter.py transcriber.py
           transcription_backends.py

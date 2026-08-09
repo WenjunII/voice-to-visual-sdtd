@@ -16,3 +16,6 @@ dist/
 .idea/
 .vscode/
 *.log
+*.jsonl
+*.jsonl.*
+logs/

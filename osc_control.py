@@ -85,10 +85,11 @@ def normalize_control_value(control_name, value):
 
 
 class OscControlServer:
-    def __init__(self, ip, port, on_control):
+    def __init__(self, ip, port, on_control, logger=print):
         self.ip = ip
         self.port = port
         self.on_control = on_control
+        self.logger = logger
         self.server = None
         self.thread = None
 
@@ -117,4 +118,4 @@ class OscControlServer:
             value = normalize_control_value(control_name, raw_value)
             self.on_control(control_name, value)
         except Exception as exc:
-            print(f"[OSC CONTROL ERROR]: {exc}")
+            self.logger(f"OSC control request failed: {exc}")
