@@ -23,6 +23,19 @@ def make_backend_adapter(*, online=False):
     return adapter
 
 
+class TestLogSession:
+    path = None
+
+    def __init__(self):
+        self.loggers = {}
+
+    def logger(self, subsystem):
+        return self.loggers.setdefault(subsystem, Mock())
+
+    def close(self):
+        return None
+
+
 def make_pipeline(config=None, *, online=False, backend_adapter=None):
     return RealTimePipeline(
         enable_vad=False,
@@ -35,6 +48,7 @@ def make_pipeline(config=None, *, online=False, backend_adapter=None):
             if backend_adapter is not None
             else make_backend_adapter(online=online)
         ),
+        log_session=TestLogSession(),
     )
 
 
@@ -242,6 +256,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
                 enable_osc_controls=True,
                 config=first_config,
                 backend_adapter=make_backend_adapter(),
+                log_session=TestLogSession(),
             )
             second = RealTimePipeline(
                 enable_vad=False,
@@ -250,6 +265,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
                 enable_osc_controls=True,
                 config=second_config,
                 backend_adapter=make_backend_adapter(),
+                log_session=TestLogSession(),
             )
 
         self.assertEqual(
@@ -275,6 +291,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             "127.0.0.4",
             7101,
             first.apply_control,
+            first.osc_logger.warning,
         )
 
     def test_vad_and_prompt_budgeting_use_the_pipeline_configuration(self):
@@ -302,6 +319,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
                 enable_osc_controls=False,
                 config=config,
                 backend_adapter=make_backend_adapter(),
+                log_session=TestLogSession(),
             )
 
         self.assertEqual(pipeline.vad.threshold, 275.0)

@@ -24,6 +24,7 @@ from runtime_config import (
     format_config_report,
     load_env_file,
 )
+from runtime_logging import RuntimeLogSession
 from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
@@ -231,19 +232,48 @@ class RealTimePipeline:
         enable_osc_controls=True,
         config=None,
         backend_adapter=None,
+        log_session=None,
     ):
         configure_dependency_environment()
         self.config = (
             config if config is not None else load_runtime_config()
         )
-        self.backend_adapter = (
-            backend_adapter
-            if backend_adapter is not None
-            else create_transcription_backend(
-                self.config,
-                sample_rate=RATE,
-            )
+        self.log_session = (
+            log_session
+            if log_session is not None
+            else RuntimeLogSession(self.config)
         )
+        self._owns_log_session = log_session is None
+        self.runtime_logger = self.log_session.logger("runtime")
+        self.audio_logger = self.log_session.logger("audio")
+        self.scheduler_logger = self.log_session.logger("scheduler")
+        self.transcription_logger = self.log_session.logger("transcription")
+        self.prompt_logger = self.log_session.logger("prompt")
+        self.osc_logger = self.log_session.logger("osc")
+        self.control_logger = self.log_session.logger("control")
+        self.backend_logger = self.log_session.logger("backend")
+        try:
+            self.backend_adapter = (
+                backend_adapter
+                if backend_adapter is not None
+                else create_transcription_backend(
+                    self.config,
+                    sample_rate=RATE,
+                    logger=self.backend_logger.info,
+                )
+            )
+        except Exception as exc:
+            self.runtime_logger.error(
+                "Transcription backend initialization failed",
+                extra={
+                    "event": "backend_initialization_error",
+                    "backend": self.config.transcription_backend,
+                    "error": self.clean_audio_error(exc),
+                },
+            )
+            if self._owns_log_session:
+                self.log_session.close()
+            raise
         self._backend_closed = False
         self.backend = self.backend_adapter.name
         self.last_online_request_time = 0
@@ -321,10 +351,25 @@ class RealTimePipeline:
         self.state_lock = threading.Lock()
         self.scene_lock = threading.Lock()
         self.osc_lock = threading.Lock()
+        self.runtime_logger.info(
+            "Runtime session initialized",
+            extra={
+                "event": "session_start",
+                "backend": self.backend,
+                "log_file": (
+                    str(self.log_session.path)
+                    if self.log_session.path is not None
+                    else ""
+                ),
+            },
+        )
 
     def create_prompt_budgeter(self):
         if not self.config.prompt_token_budget_enabled:
-            print("Prompt token budgeting is disabled.")
+            self.prompt_logger.info(
+                "Prompt token budgeting is disabled",
+                extra={"event": "prompt_budget_disabled"},
+            )
             return None
         try:
             from transformers import AutoTokenizer
@@ -333,9 +378,13 @@ class RealTimePipeline:
                 AutoTokenizer.from_pretrained(model)
                 for model in self.config.prompt_tokenizer_models
             ]
-            print(
-                f"Using {len(tokenizers)} SDXL CLIP tokenizer(s) "
-                f"with a {self.config.prompt_max_tokens}-token prompt limit."
+            self.prompt_logger.info(
+                "Prompt token budgeting initialized",
+                extra={
+                    "event": "prompt_budget_initialized",
+                    "tokenizer_count": len(tokenizers),
+                    "max_tokens": self.config.prompt_max_tokens,
+                },
             )
             return PromptBudgeter(
                 tokenizers,
@@ -345,7 +394,13 @@ class RealTimePipeline:
                 ),
             )
         except Exception as exc:
-            print(f"[PROMPT BUDGET]: Tokenizers unavailable ({exc}). Prompts will not be token-limited.")
+            self.prompt_logger.warning(
+                "Prompt tokenizers unavailable; prompts will not be limited",
+                extra={
+                    "event": "prompt_budget_unavailable",
+                    "error": self.clean_audio_error(exc),
+                },
+            )
             return None
 
     def create_voice_activity_detector(self):
@@ -355,22 +410,42 @@ class RealTimePipeline:
                     self.config.vad_threshold,
                     sample_rate=RATE,
                 )
-                print(
-                    "Using Silero VAD on CPU "
-                    f"(threshold {self.config.vad_threshold:.2f})."
+                self.audio_logger.info(
+                    "Silero voice activity detection initialized",
+                    extra={
+                        "event": "vad_initialized",
+                        "engine": "silero",
+                        "threshold": self.config.vad_threshold,
+                    },
                 )
                 return detector
             except Exception as exc:
-                print(f"[VAD]: Silero unavailable ({exc}). Falling back to energy detection.")
+                self.audio_logger.warning(
+                    "Silero unavailable; falling back to energy detection",
+                    extra={
+                        "event": "vad_fallback",
+                        "from_engine": "silero",
+                        "to_engine": "energy",
+                        "error": self.clean_audio_error(exc),
+                    },
+                )
         elif self.config.vad_engine != "energy":
-            print(
-                f"[VAD]: Unknown engine '{self.config.vad_engine}'. "
-                "Falling back to energy detection."
+            self.audio_logger.warning(
+                "Unknown VAD engine; falling back to energy detection",
+                extra={
+                    "event": "vad_fallback",
+                    "from_engine": self.config.vad_engine,
+                    "to_engine": "energy",
+                },
             )
 
-        print(
-            "Using energy VAD "
-            f"(threshold {self.config.vad_energy_threshold:.0f})."
+        self.audio_logger.info(
+            "Energy voice activity detection initialized",
+            extra={
+                "event": "vad_initialized",
+                "engine": "energy",
+                "threshold": self.config.vad_energy_threshold,
+            },
         )
         return EnergyVoiceActivityDetector(
             self.config.vad_energy_threshold
@@ -405,7 +480,13 @@ class RealTimePipeline:
         try:
             is_speech = self.vad.is_speech(audio_data)
         except Exception as exc:
-            print(f"\n[VAD ERROR]: {exc}. Switching to energy detection.")
+            self.audio_logger.error(
+                "Voice activity detection failed; switching to energy",
+                extra={
+                    "event": "vad_runtime_fallback",
+                    "error": self.clean_audio_error(exc),
+                },
+            )
             self.vad = EnergyVoiceActivityDetector(
                 self.config.vad_energy_threshold
             )
@@ -422,7 +503,13 @@ class RealTimePipeline:
         now = time.monotonic()
         for segment in completed:
             if self.scheduler.submit_final(segment, now) is None:
-                print("\n[SCHEDULER]: Final queue is full; newest final segment was dropped.")
+                self.scheduler_logger.warning(
+                    "Final queue is full; newest segment was dropped",
+                    extra={
+                        "event": "scheduler_final_dropped",
+                        "segment_id": segment.segment_id,
+                    },
+                )
         self.send_runtime_status()
 
     def wait_for_audio_retry(self, delay_seconds):
@@ -457,7 +544,13 @@ class RealTimePipeline:
         if segment is None or segment.samples.size == 0:
             return
         if self.scheduler.submit_final(segment, time.monotonic()) is None:
-            print("\n[SCHEDULER]: Final queue is full; interrupted audio was dropped.")
+            self.scheduler_logger.warning(
+                "Final queue is full; interrupted audio was dropped",
+                extra={
+                    "event": "scheduler_interrupted_audio_dropped",
+                    "segment_id": segment.segment_id,
+                },
+            )
 
     def audio_callback(self):
         reconnect_attempt = 0
@@ -471,14 +564,23 @@ class RealTimePipeline:
                 stream = self.open_microphone_stream(audio_interface)
 
                 if self.audio_reconnects:
-                    print(
-                        f"\n[AUDIO RECOVERED]: [{self.audio_device_index}] "
-                        f"{self.audio_device_name} is available again."
+                    self.audio_logger.info(
+                        "Microphone connection recovered",
+                        extra={
+                            "event": "audio_recovered",
+                            "device_index": self.audio_device_index,
+                            "device_name": self.audio_device_name,
+                            "reconnects": self.audio_reconnects,
+                        },
                     )
                 else:
-                    print(
-                        f"\n>>> Active on [{self.audio_device_index}] {self.audio_device_name}. "
-                        "Visuals will update when you speak."
+                    self.audio_logger.info(
+                        "Microphone stream opened",
+                        extra={
+                            "event": "audio_stream_opened",
+                            "device_index": self.audio_device_index,
+                            "device_name": self.audio_device_name,
+                        },
                     )
                 self.audio_status = "ready"
                 self.last_audio_error = ""
@@ -503,10 +605,14 @@ class RealTimePipeline:
                                 f"microphone read failed {consecutive_read_errors} consecutive times: {exc}"
                             ) from exc
 
-                        print(
-                            f"\n[AUDIO READ ERROR]: {exc} "
-                            f"({consecutive_read_errors}/{max_read_errors}); "
-                            "retrying the current stream."
+                        self.audio_logger.warning(
+                            "Microphone read failed; retrying current stream",
+                            extra={
+                                "event": "audio_read_error",
+                                "error": self.clean_audio_error(exc),
+                                "consecutive_errors": consecutive_read_errors,
+                                "max_consecutive_errors": max_read_errors,
+                            },
                         )
                         if not self.wait_for_audio_retry(
                             self.config.audio_read_retry_seconds
@@ -515,7 +621,10 @@ class RealTimePipeline:
                         continue
 
                     if consecutive_read_errors:
-                        print("\n[AUDIO RECOVERED]: Microphone reads resumed.")
+                        self.audio_logger.info(
+                            "Microphone reads resumed",
+                            extra={"event": "audio_reads_resumed"},
+                        )
                         self.audio_status = "ready"
                         self.last_audio_error = ""
                         self.send_runtime_status(force=True)
@@ -524,7 +633,13 @@ class RealTimePipeline:
                     try:
                         self.process_audio_data(data)
                     except Exception as exc:
-                        print(f"\n[AUDIO PROCESSING ERROR]: {exc}")
+                        self.audio_logger.error(
+                            "Audio processing failed",
+                            extra={
+                                "event": "audio_processing_error",
+                                "error": self.clean_audio_error(exc),
+                            },
+                        )
             except Exception as exc:
                 failure = exc
             finally:
@@ -540,7 +655,13 @@ class RealTimePipeline:
             if not self.config.audio_reconnect_enabled:
                 self.audio_status = "error"
                 self.is_running = False
-                print(f"\n[AUDIO ERROR]: {failure}. Automatic reconnection is disabled.")
+                self.audio_logger.error(
+                    "Microphone failed and automatic reconnection is disabled",
+                    extra={
+                        "event": "audio_terminal_error",
+                        "error": self.clean_audio_error(failure),
+                    },
+                )
                 self.send_runtime_status(force=True)
                 break
 
@@ -552,9 +673,14 @@ class RealTimePipeline:
             reconnect_attempt += 1
             self.audio_reconnects += 1
             self.audio_status = "reconnecting"
-            print(
-                f"\n[AUDIO RECONNECT]: {failure}. "
-                f"Retrying in {retry_delay:.1f}s (attempt {self.audio_reconnects})."
+            self.audio_logger.warning(
+                "Microphone unavailable; scheduling reconnect",
+                extra={
+                    "event": "audio_reconnect_scheduled",
+                    "error": self.clean_audio_error(failure),
+                    "retry_in_seconds": retry_delay,
+                    "attempt": self.audio_reconnects,
+                },
             )
             self.send_runtime_status(force=True)
             if not self.wait_for_audio_retry(retry_delay):
@@ -563,6 +689,13 @@ class RealTimePipeline:
         if self.audio_status != "error":
             self.audio_status = "stopped"
             self.is_speaking = False
+            self.audio_logger.info(
+                "Microphone capture stopped",
+                extra={
+                    "event": "audio_stopped",
+                    "reconnects": self.audio_reconnects,
+                },
+            )
             self.send_runtime_status(force=True)
 
     @staticmethod
@@ -598,7 +731,15 @@ class RealTimePipeline:
                 self.handle_retryable_failure(job, exc)
                 continue
             except Exception as exc:
-                print(f"\n[TRANSCRIPTION ERROR]: {exc}")
+                self.transcription_logger.error(
+                    "Transcription failed",
+                    extra={
+                        "event": "transcription_error",
+                        "error": self.clean_audio_error(exc),
+                        "segment_id": job.segment.segment_id,
+                        "is_final": job.is_final,
+                    },
+                )
                 self.scheduler.mark_failed()
                 self.backend_status = "error"
                 self.cleanup_final_job(job)
@@ -611,6 +752,21 @@ class RealTimePipeline:
             self.scheduler.mark_processed()
             self.backend_status = "ready"
             self.backend_retry_not_before = 0.0
+            self.transcription_logger.info(
+                "Transcription completed",
+                extra={
+                    "event": "transcription_completed",
+                    "backend": self.backend,
+                    "segment_id": job.segment.segment_id,
+                    "is_final": job.is_final,
+                    "audio_seconds": (
+                        len(job.segment.samples) / RATE
+                    ),
+                    "latency_asr_seconds": self.last_inference_latency,
+                    "latency_total_seconds": self.last_total_latency,
+                    "character_count": len(text or ""),
+                },
+            )
 
             if is_probable_whisper_hallucination(text):
                 text = ""
@@ -675,16 +831,30 @@ class RealTimePipeline:
         should_retry = job.is_final and job.attempts < max_retries
         if should_retry and self.scheduler.retry_final(job, now, retry_delay):
             self.backend_status = "retrying"
-            print(
-                f"\n[TRANSCRIPTION RETRY]: Final segment {job.segment.segment_id} "
-                f"in {retry_delay:.1f}s "
-                f"({job.attempts + 1}/{max_retries})."
+            self.transcription_logger.warning(
+                "Final transcription segment scheduled for retry",
+                extra={
+                    "event": "transcription_retry_scheduled",
+                    "segment_id": job.segment.segment_id,
+                    "retry_in_seconds": retry_delay,
+                    "attempt": job.attempts + 1,
+                    "max_retries": max_retries,
+                    "error": self.clean_audio_error(exc),
+                },
             )
         else:
             self.scheduler.mark_failed()
             self.backend_status = "error"
             self.cleanup_final_job(job)
-            print(f"\n[TRANSCRIPTION ERROR]: {exc}")
+            self.transcription_logger.error(
+                "Transcription retries exhausted",
+                extra={
+                    "event": "transcription_retry_exhausted",
+                    "segment_id": job.segment.segment_id,
+                    "attempts": job.attempts,
+                    "error": self.clean_audio_error(exc),
+                },
+            )
         self.send_runtime_status(force=True)
 
     def cleanup_final_job(self, job):
@@ -767,6 +937,18 @@ class RealTimePipeline:
             self.send_osc_message("/transcript_final", raw_text)
 
         state = "FINAL" if is_final else "STABLE"
+        self.prompt_logger.info(
+            "Visual prompt emitted",
+            extra={
+                "event": "prompt_emitted",
+                "state": state.lower(),
+                "scene_character_count": len(text),
+                "transcript_character_count": len(raw_text),
+                "prompt_tokens": self.last_prompt_token_count,
+                "prompt_variant": self.last_prompt_variant,
+                "transcript_trimmed": self.last_prompt_trimmed,
+            },
+        )
         print(f"\n[PROMPT {state}]: {text}")
         if raw_text != text:
             print(f"[CURRENT TRANSCRIPT]: {raw_text}")
@@ -780,6 +962,14 @@ class RealTimePipeline:
         final_prompt = self.build_visual_prompt(text)
         self.send_osc_message("/prompt", final_prompt)
         self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
+        self.prompt_logger.info(
+            "Visual prompt refreshed after control change",
+            extra={
+                "event": "prompt_refreshed",
+                "prompt_tokens": self.last_prompt_token_count,
+                "prompt_variant": self.last_prompt_variant,
+            },
+        )
         print(f"\n[PROMPT REFRESH]: Applied the current visual controls to: {text}")
         return True
 
@@ -862,10 +1052,16 @@ class RealTimePipeline:
         self.last_prompt_trimmed = result.transcript_trimmed
         if self.config.prompt_log_tokens:
             trimmed = ", newest transcript retained" if result.transcript_trimmed else ""
-            print(
-                f"\n[PROMPT TOKENS]: {result.token_count}/"
-                f"{self.config.prompt_max_tokens} "
-                f"({result.variant}{trimmed})"
+            self.prompt_logger.info(
+                "Prompt token budget measured",
+                extra={
+                    "event": "prompt_budget_measured",
+                    "token_count": result.token_count,
+                    "max_tokens": self.config.prompt_max_tokens,
+                    "variant": result.variant,
+                    "transcript_trimmed": result.transcript_trimmed,
+                    "detail": trimmed.lstrip(", "),
+                },
             )
         return result.text
 
@@ -963,18 +1159,30 @@ class RealTimePipeline:
             self.config.osc_control_ip,
             self.config.osc_control_port,
             self.apply_control,
+            self.osc_logger.warning,
         )
         try:
             address = server.start()
         except OSError as exc:
-            print(
-                "[OSC CONTROL]: Could not bind "
-                f"{self.config.osc_control_ip}:"
-                f"{self.config.osc_control_port} ({exc})."
+            self.osc_logger.error(
+                "OSC control server could not bind",
+                extra={
+                    "event": "osc_control_bind_error",
+                    "ip": self.config.osc_control_ip,
+                    "port": self.config.osc_control_port,
+                    "error": self.clean_audio_error(exc),
+                },
             )
             return
         self.osc_control_server = server
-        print(f"[OSC CONTROL]: Listening on {address[0]}:{address[1]}.")
+        self.osc_logger.info(
+            "OSC control server listening",
+            extra={
+                "event": "osc_control_listening",
+                "ip": address[0],
+                "port": address[1],
+            },
+        )
 
     def apply_control(self, control_name, value):
         if control_name == "request_status":
@@ -986,7 +1194,10 @@ class RealTimePipeline:
                 self.last_text = ""
             self.send_osc_message("/scene_context", "")
             self.send_osc_message("/scene_reset", 1)
-            print("\n[MODE]: SCENE MEMORY -> RESET")
+            self.control_logger.info(
+                "Scene memory reset",
+                extra={"event": "scene_memory_reset"},
+            )
             return
 
         valid_values = {
@@ -1016,7 +1227,15 @@ class RealTimePipeline:
                 self.current_language = value
                 label = "AUTO-DETECT" if value is None else valid_values["language"][value]
 
-        print(f"\n[MODE]: {control_name.upper()} -> {label}")
+        self.control_logger.info(
+            "Runtime control changed",
+            extra={
+                "event": "control_changed",
+                "control": control_name,
+                "value": "auto" if value is None else value,
+                "label": label,
+            },
+        )
         acknowledgement = "auto" if value is None else str(value)
         self.send_osc_message("/control_ack", f"{control_name}:{acknowledgement}")
         if control_name in {"gender", "age", "visual_mode", "prompt_style"}:
@@ -1072,7 +1291,10 @@ class RealTimePipeline:
                         self.apply_control(*control)
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            self.runtime_logger.info(
+                "Shutdown requested from keyboard",
+                extra={"event": "shutdown_requested"},
+            )
         finally:
             self.is_running = False
             self.backend_status = "stopped"
@@ -1088,7 +1310,25 @@ class RealTimePipeline:
         if self._backend_closed:
             return
         self._backend_closed = True
-        self.backend_adapter.close()
+        try:
+            self.backend_adapter.close()
+        finally:
+            metrics = self.scheduler.metrics()
+            self.runtime_logger.info(
+                "Runtime session stopped",
+                extra={
+                    "event": "session_stop",
+                    "backend": self.backend,
+                    "audio_reconnects": self.audio_reconnects,
+                    "processed_jobs": metrics.processed,
+                    "failed_jobs": metrics.failed,
+                    "dropped_jobs": (
+                        metrics.dropped_stale + metrics.dropped_finals
+                    ),
+                },
+            )
+            if self._owns_log_session:
+                self.log_session.close()
 
 
 def main(argv=None):
