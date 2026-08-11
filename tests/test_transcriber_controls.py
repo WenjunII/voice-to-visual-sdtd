@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -185,6 +186,88 @@ class BackendAdapterIntegrationTests(unittest.TestCase):
         pipeline.close()
 
         adapter.close.assert_called_once_with()
+
+
+class PipelineLifecycleTests(unittest.TestCase):
+    def test_shutdown_interrupts_an_audio_retry_wait(self):
+        pipeline = make_pipeline()
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(
+                pipeline.wait_for_audio_retry(10.0)
+            )
+        )
+        waiter.start()
+
+        pipeline.request_shutdown("test")
+        waiter.join(timeout=0.5)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [False])
+        pipeline.close()
+
+    def test_close_waits_for_workers_before_closing_resources(self):
+        pipeline = make_pipeline(
+            replace(
+                RuntimeConfig(),
+                runtime_shutdown_grace_seconds=0.02,
+            )
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_stopped = threading.Event()
+        backend_closed_after_worker = []
+
+        def blocked_audio_worker():
+            worker_started.set()
+            release_worker.wait()
+            worker_stopped.set()
+
+        pipeline.audio_callback = blocked_audio_worker
+        pipeline.transcription_loop = Mock()
+        pipeline.backend_adapter.close.side_effect = lambda: (
+            backend_closed_after_worker.append(worker_stopped.is_set())
+        )
+        workers = pipeline.start_worker_threads()
+        self.assertTrue(worker_started.wait(timeout=0.5))
+        self.assertTrue(all(not worker.daemon for worker in workers))
+
+        release_timer = threading.Timer(0.08, release_worker.set)
+        release_timer.start()
+        try:
+            pipeline.close()
+        finally:
+            release_worker.set()
+            release_timer.join(timeout=0.5)
+
+        self.assertTrue(worker_stopped.is_set())
+        self.assertEqual(backend_closed_after_worker, [True])
+        warning = pipeline.runtime_logger.warning.call_args
+        self.assertEqual(
+            warning.kwargs["extra"]["event"],
+            "worker_shutdown_overdue",
+        )
+        self.assertEqual(
+            warning.kwargs["extra"]["workers"],
+            ["voice-to-visual-audio"],
+        )
+
+    def test_worker_crash_requests_pipeline_shutdown(self):
+        pipeline = make_pipeline()
+
+        def crashing_audio_worker():
+            raise RuntimeError("audio worker failed")
+
+        pipeline.audio_callback = crashing_audio_worker
+        pipeline.transcription_loop = lambda: pipeline.stop_event.wait(0.5)
+        pipeline.start_worker_threads()
+        pipeline.join_worker_threads()
+
+        self.assertTrue(pipeline.stop_event.is_set())
+        crash = pipeline.runtime_logger.exception.call_args
+        self.assertEqual(crash.kwargs["extra"]["event"], "worker_crashed")
+        self.assertEqual(crash.kwargs["extra"]["worker"], "audio")
+        pipeline.close()
 
 
 class PipelineConfigurationIsolationTests(unittest.TestCase):
@@ -396,7 +479,7 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         stream = Mock()
 
         def read_once(*_args, **_kwargs):
-            pipeline.is_running = False
+            pipeline.request_shutdown()
             return b"\x00\x00" * 16
 
         stream.read.side_effect = read_once

@@ -22,6 +22,8 @@ class OscControlTests(unittest.TestCase):
 
         server = OscControlServer("127.0.0.1", 0, on_control)
         address = server.start()
+        self.assertEqual(server.thread.name, "voice-to-visual-osc-control")
+        self.assertFalse(server.thread.daemon)
         client = None
         try:
             client = udp_client.SimpleUDPClient(*address)

@@ -98,7 +98,10 @@ class OscControlServer:
         for address, control_name in CONTROL_ADDRESSES.items():
             dispatcher.map(address, partial(self._handle, control_name))
         self.server = ThreadingOSCUDPServer((self.ip, self.port), dispatcher)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            name="voice-to-visual-osc-control",
+            target=self.server.serve_forever,
+        )
         self.thread.start()
         return self.server.server_address
 
@@ -108,7 +111,7 @@ class OscControlServer:
         self.server.shutdown()
         self.server.server_close()
         if self.thread is not None:
-            self.thread.join(timeout=2.0)
+            self.thread.join()
         self.server = None
         self.thread = None
 

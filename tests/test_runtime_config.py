@@ -25,6 +25,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.runtime_log_level, "info")
         self.assertTrue(config.runtime_log_console_enabled)
         self.assertEqual(config.runtime_log_file, "")
+        self.assertEqual(config.runtime_shutdown_grace_seconds, 25.0)
         self.assertEqual(config.audio_input_device_index, None)
         self.assertEqual(
             config.prompt_tokenizer_models,
@@ -86,6 +87,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     "RUNTIME_LOG_LEVEL": "verbose",
                     "RUNTIME_LOG_MAX_BYTES": "0",
                     "RUNTIME_LOG_BACKUP_COUNT": "-1",
+                    "RUNTIME_SHUTDOWN_GRACE_SECONDS": "0",
                 }
             )
 
@@ -112,6 +114,10 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertIn(
             "RUNTIME_LOG_BACKUP_COUNT must be greater than 0",
+            errors,
+        )
+        self.assertIn(
+            "RUNTIME_SHUTDOWN_GRACE_SECONDS must be greater than 0",
             errors,
         )
 
