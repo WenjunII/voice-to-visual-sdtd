@@ -275,6 +275,11 @@ class RealTimePipeline:
                 self.log_session.close()
             raise
         self._backend_closed = False
+        self.stop_event = threading.Event()
+        self._worker_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._worker_threads = {}
+        self._workers_started = False
         self.backend = self.backend_adapter.name
         self.last_online_request_time = 0
         self.last_whisper_request_time = 0
@@ -326,7 +331,6 @@ class RealTimePipeline:
         self.last_prompt_variant = "unbudgeted"
         self.last_prompt_trimmed = False
         self.last_text = ""
-        self.is_running = True
         self.is_speaking = False
         self.audio_status = "starting"
         self.audio_reconnects = 0
@@ -363,6 +367,124 @@ class RealTimePipeline:
                 ),
             },
         )
+
+    @property
+    def is_running(self):
+        return not self.stop_event.is_set()
+
+    def request_shutdown(self, reason=None):
+        was_requested = self.stop_event.is_set()
+        self.stop_event.set()
+        if not was_requested and reason:
+            self.runtime_logger.info(
+                "Runtime shutdown requested",
+                extra={
+                    "event": "shutdown_requested",
+                    "reason": reason,
+                },
+            )
+        return not was_requested
+
+    def start_worker_threads(self):
+        with self._worker_lock:
+            if self._workers_started:
+                raise RuntimeError("Runtime workers have already been started")
+            if self._backend_closed:
+                raise RuntimeError("Runtime workers cannot start after close")
+
+            self._workers_started = True
+            workers = {
+                "audio": threading.Thread(
+                    name="voice-to-visual-audio",
+                    target=self._run_worker,
+                    args=("audio", self.audio_callback),
+                ),
+                "transcription": threading.Thread(
+                    name="voice-to-visual-transcription",
+                    target=self._run_worker,
+                    args=("transcription", self.transcription_loop),
+                ),
+            }
+            self._worker_threads = workers
+
+        for worker in workers.values():
+            worker.start()
+
+        self.runtime_logger.info(
+            "Runtime workers started",
+            extra={
+                "event": "workers_started",
+                "workers": sorted(workers),
+            },
+        )
+        return tuple(workers.values())
+
+    def _run_worker(self, worker_name, target):
+        try:
+            target()
+        except Exception as exc:
+            self.runtime_logger.exception(
+                "Runtime worker crashed",
+                extra={
+                    "event": "worker_crashed",
+                    "worker": worker_name,
+                    "error": self.clean_audio_error(exc),
+                },
+            )
+            self.request_shutdown()
+        finally:
+            self.runtime_logger.debug(
+                "Runtime worker stopped",
+                extra={
+                    "event": "worker_stopped",
+                    "worker": worker_name,
+                },
+            )
+
+    def join_worker_threads(self):
+        with self._worker_lock:
+            workers = tuple(self._worker_threads.values())
+
+        if not workers:
+            return ()
+
+        current_worker = threading.current_thread()
+        workers = tuple(
+            worker for worker in workers if worker is not current_worker
+        )
+        started = time.monotonic()
+        deadline = started + self.config.runtime_shutdown_grace_seconds
+        for worker in workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+
+        overdue = tuple(worker for worker in workers if worker.is_alive())
+        if overdue:
+            self.runtime_logger.warning(
+                "Runtime workers exceeded the shutdown grace period",
+                extra={
+                    "event": "worker_shutdown_overdue",
+                    "grace_seconds": (
+                        self.config.runtime_shutdown_grace_seconds
+                    ),
+                    "workers": [worker.name for worker in overdue],
+                },
+            )
+            for worker in overdue:
+                worker.join()
+
+        with self._worker_lock:
+            self._worker_threads.clear()
+
+        self.runtime_logger.info(
+            "Runtime workers stopped",
+            extra={
+                "event": "workers_stopped",
+                "elapsed_seconds": time.monotonic() - started,
+                "overdue_workers": [worker.name for worker in overdue],
+            },
+        )
+        return overdue
 
     def create_prompt_budgeter(self):
         if not self.config.prompt_token_budget_enabled:
@@ -513,13 +635,7 @@ class RealTimePipeline:
         self.send_runtime_status()
 
     def wait_for_audio_retry(self, delay_seconds):
-        deadline = time.monotonic() + max(0.0, delay_seconds)
-        while self.is_running:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return True
-            time.sleep(min(0.1, remaining))
-        return False
+        return not self.stop_event.wait(max(0.0, delay_seconds))
 
     @staticmethod
     def close_audio_session(stream, audio_interface):
@@ -654,7 +770,7 @@ class RealTimePipeline:
             self.last_audio_error = self.clean_audio_error(failure)
             if not self.config.audio_reconnect_enabled:
                 self.audio_status = "error"
-                self.is_running = False
+                self.request_shutdown()
                 self.audio_logger.error(
                     "Microphone failed and automatic reconnection is disabled",
                     extra={
@@ -707,7 +823,8 @@ class RealTimePipeline:
             now = time.monotonic()
             if not self.request_interval_ready(now):
                 self.send_runtime_status()
-                time.sleep(0.05)
+                if self.stop_event.wait(0.05):
+                    break
                 continue
 
             with self.lock:
@@ -718,7 +835,8 @@ class RealTimePipeline:
             job = self.scheduler.next_job(now)
             if job is None:
                 self.send_runtime_status()
-                time.sleep(0.05)
+                if self.stop_event.wait(0.05):
+                    break
                 continue
 
             self.mark_request_started(now)
@@ -1244,11 +1362,7 @@ class RealTimePipeline:
 
     def start(self):
         self.start_osc_control_server()
-        t1 = threading.Thread(target=self.audio_callback, daemon=True)
-        t2 = threading.Thread(target=self.transcription_loop, daemon=True)
-        
-        t1.start()
-        t2.start()
+        self.start_worker_threads()
         
         try:
             print("\n" + "="*50)
@@ -1289,46 +1403,53 @@ class RealTimePipeline:
                     control = KEYBOARD_CONTROLS.get(key)
                     if control is not None:
                         self.apply_control(*control)
-                time.sleep(0.1)
+                if self.stop_event.wait(0.1):
+                    break
         except KeyboardInterrupt:
-            self.runtime_logger.info(
-                "Shutdown requested from keyboard",
-                extra={"event": "shutdown_requested"},
-            )
+            self.request_shutdown("keyboard_interrupt")
         finally:
-            self.is_running = False
-            self.backend_status = "stopped"
-            self.is_speaking = False
-            self.send_runtime_status(force=True)
-            t1.join(timeout=2.0)
-            t2.join(timeout=2.0)
-            if self.osc_control_server is not None:
-                self.osc_control_server.stop()
             self.close()
 
     def close(self):
-        if self._backend_closed:
-            return
-        self._backend_closed = True
-        try:
-            self.backend_adapter.close()
-        finally:
-            metrics = self.scheduler.metrics()
-            self.runtime_logger.info(
-                "Runtime session stopped",
-                extra={
-                    "event": "session_stop",
-                    "backend": self.backend,
-                    "audio_reconnects": self.audio_reconnects,
-                    "processed_jobs": metrics.processed,
-                    "failed_jobs": metrics.failed,
-                    "dropped_jobs": (
-                        metrics.dropped_stale + metrics.dropped_finals
-                    ),
-                },
-            )
-            if self._owns_log_session:
-                self.log_session.close()
+        with self._close_lock:
+            if self._backend_closed:
+                return
+
+            self.request_shutdown()
+            if self._workers_started:
+                self.backend_status = "stopped"
+                self.is_speaking = False
+                self.send_runtime_status(force=True)
+            if self.osc_control_server is not None:
+                self.osc_control_server.stop()
+                self.osc_control_server = None
+
+            self.join_worker_threads()
+            self.backend_status = "stopped"
+            self.is_speaking = False
+            if self._workers_started:
+                self.send_runtime_status(force=True)
+
+            self._backend_closed = True
+            try:
+                self.backend_adapter.close()
+            finally:
+                metrics = self.scheduler.metrics()
+                self.runtime_logger.info(
+                    "Runtime session stopped",
+                    extra={
+                        "event": "session_stop",
+                        "backend": self.backend,
+                        "audio_reconnects": self.audio_reconnects,
+                        "processed_jobs": metrics.processed,
+                        "failed_jobs": metrics.failed,
+                        "dropped_jobs": (
+                            metrics.dropped_stale + metrics.dropped_finals
+                        ),
+                    },
+                )
+                if self._owns_log_session:
+                    self.log_session.close()
 
 
 def main(argv=None):

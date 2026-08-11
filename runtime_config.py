@@ -174,6 +174,9 @@ class RuntimeConfig:
     runtime_log_backup_count: int = _config_field(
         "RUNTIME_LOG_BACKUP_COUNT", 3
     )
+    runtime_shutdown_grace_seconds: float = _config_field(
+        "RUNTIME_SHUTDOWN_GRACE_SECONDS", 25.0
+    )
 
     transcription_max_final_jobs: int = _config_field(
         "TRANSCRIPTION_MAX_FINAL_JOBS", 8
@@ -375,6 +378,9 @@ class RuntimeConfig:
                 "OSC_STATUS_INTERVAL": self.osc_status_interval,
                 "RUNTIME_LOG_MAX_BYTES": self.runtime_log_max_bytes,
                 "RUNTIME_LOG_BACKUP_COUNT": self.runtime_log_backup_count,
+                "RUNTIME_SHUTDOWN_GRACE_SECONDS": (
+                    self.runtime_shutdown_grace_seconds
+                ),
                 "TRANSCRIPTION_MAX_FINAL_JOBS": self.transcription_max_final_jobs,
                 "TRANSCRIPTION_RETRY_BASE_SECONDS": self.transcription_retry_base_seconds,
                 "TRANSCRIPTION_RETRY_MAX_SECONDS": self.transcription_retry_max_seconds,

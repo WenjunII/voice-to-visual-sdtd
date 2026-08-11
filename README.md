@@ -24,6 +24,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
 - **Structured Session Logging**: Labels operational events by subsystem, captures latency/retry/reconnection metrics, optionally rotates JSON Lines log files, and redacts configured credentials.
+- **Graceful Worker Shutdown**: Uses cooperative cancellation, owned non-daemon workers, interruptible retry waits, and ordered cleanup so backend and log resources stay open until audio and transcription stop.
 - **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
 ## Tech Stack
@@ -184,6 +185,8 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     RUNTIME_LOG_FILE=
     RUNTIME_LOG_MAX_BYTES=5000000
     RUNTIME_LOG_BACKUP_COUNT=3
+    # Log overdue workers after this grace period, then keep waiting before cleanup.
+    RUNTIME_SHUTDOWN_GRACE_SECONDS=25.0
 
     # Keep recent scene details while removing repeated overlap between segments.
     SCENE_MEMORY_MAX_WORDS=36
@@ -296,9 +299,16 @@ RUNTIME_LOG_CONSOLE_ENABLED=true
 RUNTIME_LOG_FILE=logs/voice-to-visual.jsonl
 RUNTIME_LOG_MAX_BYTES=5000000
 RUNTIME_LOG_BACKUP_COUNT=3
+RUNTIME_SHUTDOWN_GRACE_SECONDS=25.0
 ```
 
 The file rotates before exceeding the configured size and retains the configured number of backups. Each record contains a timestamp, session ID, subsystem, event name, level, message, and relevant metrics. Raw prompt and transcript text remains in the live console instead of the operational file, and configured API keys plus bearer credentials are replaced with `<redacted>`.
+
+### Graceful Shutdown
+
+Ctrl+C and terminal audio failures signal the audio and transcription workers through a shared cancellation event. Retry and idle waits wake immediately, the OSC control server stops accepting changes, and the runtime waits for in-flight work before closing the transcription backend and log session.
+
+`RUNTIME_SHUTDOWN_GRACE_SECONDS` is an observability threshold rather than a destructive timeout. If a worker is still active after the grace period, the runtime records a `worker_shutdown_overdue` warning with the worker name and continues waiting. This preserves cleanup ordering and avoids closing an HTTP session, model, or log handler while a worker is still using it.
 
 ### OSC Output to TouchDesigner
 
@@ -346,7 +356,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 
 ## Runtime Structure
 
-- `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, and process lifecycle. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
+- `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, cooperative worker cancellation, and ordered process cleanup. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
 - `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
@@ -376,7 +386,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, log rotation, structured fields, and credential redaction. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 
