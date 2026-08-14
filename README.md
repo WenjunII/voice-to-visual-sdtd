@@ -15,6 +15,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
 - **Automatic Microphone Recovery**: Brief read glitches retry in place, repeated failures safely finalize buffered speech, and disconnected or unavailable devices reopen with capped exponential backoff.
 - **Explicit Microphone Selection**: List available input devices and pin live capture and diagnostics to a specific PyAudio device index, or keep following the Windows system default.
+- **Audio Source Adapters & WAV Replay**: Keeps microphone ownership outside the pipeline and can replay a recording through the real VAD, segmentation, scheduling, transcription, prompt, logging, and OSC path without audio hardware.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
@@ -289,6 +290,19 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```
 6.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
 
+### Deterministic WAV Replay
+
+Replay an uncompressed 16-bit PCM WAV recording through the live pipeline at real-time speed:
+
+```powershell
+python transcriber.py --replay .\sample.wav
+python transcriber.py --backend faster_whisper --replay .\sample.wav
+```
+
+Replay accepts mono or multichannel PCM input at any valid sample rate. It converts the recording to the runtime's 16 kHz mono format, sends stable chunks through the same VAD and scheduler used by the microphone, drains the final transcription job, and then exits automatically. OSC output and controls remain enabled, so a recording can reproduce a complete TouchDesigner session without PyAudio or a live input device.
+
+`--replay` cannot be combined with `--benchmark` or `--input-device`. Benchmark mode calls the selected local model repeatedly to measure performance; replay mode processes the recording once through the complete streaming system.
+
 ### Runtime Logging
 
 Operational events use `debug`, `info`, `warning`, `error`, or `critical` levels and identify their subsystem, including `audio`, `backend`, `transcription`, `scheduler`, `prompt`, `osc`, and `control`. Console logs remain human-readable. Set `RUNTIME_LOG_FILE` to enable persistent JSON Lines logs:
@@ -328,10 +342,11 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 | `/retry_in` | Seconds until a rate-limited or transiently unavailable backend may be called again |
 | `/dropped_jobs` | Total stale or capacity-dropped jobs |
 | `/audio_status` | `starting`, `ready`, `degraded`, `reconnecting`, `error`, or `stopped` |
+| `/audio_source` | `microphone` or `wav_replay` |
 | `/audio_reconnects` | Total microphone reopen attempts during this run |
 | `/audio_error` | Most recent microphone error, cleared after recovery |
-| `/audio_device_index` | Resolved PyAudio input-device index, or `-1` before the system default resolves |
-| `/audio_device_name` | Resolved microphone name |
+| `/audio_device_index` | Resolved PyAudio input-device index, or `-1` for unresolved/default input and WAV replay |
+| `/audio_device_name` | Resolved microphone name or replay filename |
 | `/gender` | Active gender mode |
 | `/age` | Active age mode |
 | `/visual_mode` | Active visual identity mode |
@@ -357,6 +372,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 ## Runtime Structure
 
 - `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, cooperative worker cancellation, and ordered process cleanup. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
+- `audio_sources.py` owns lazy PyAudio setup, microphone streams, WAV decoding/resampling, deterministic chunking, replay pacing, and source cleanup.
 - `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
@@ -377,7 +393,7 @@ python transcriber.py --backend faster_whisper --benchmark .\sample.wav --benchm
 python transcriber.py --backend whisper --benchmark .\sample.wav --benchmark-runs 3
 ```
 
-The benchmark performs one warm-up pass, then reports latency and real-time factor for each measured run. A real-time factor below `1.0` means transcription is faster than the recording duration.
+The benchmark shares replay's validated PCM decoder, performs one warm-up pass, then reports latency and real-time factor for each measured run. A real-time factor below `1.0` means transcription is faster than the recording duration.
 
 Run the streaming logic tests without loading a Whisper model:
 
@@ -386,7 +402,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, WAV conversion and replay, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 

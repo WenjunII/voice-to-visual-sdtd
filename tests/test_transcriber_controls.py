@@ -1,16 +1,20 @@
 import sys
+import tempfile
 import threading
 import types
 import unittest
+import wave
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from audio_sources import WavReplaySource
 from backend_errors import RetryableTranscriptionError
 from runtime_config import RuntimeConfig
-from transcriber import RealTimePipeline, parse_args
+from transcriber import RealTimePipeline, main, parse_args
 
 
 def make_backend_adapter(*, online=False):
@@ -37,7 +41,13 @@ class TestLogSession:
         return None
 
 
-def make_pipeline(config=None, *, online=False, backend_adapter=None):
+def make_pipeline(
+    config=None,
+    *,
+    online=False,
+    backend_adapter=None,
+    audio_source=None,
+):
     return RealTimePipeline(
         enable_vad=False,
         enable_osc=False,
@@ -50,6 +60,7 @@ def make_pipeline(config=None, *, online=False, backend_adapter=None):
             else make_backend_adapter(online=online)
         ),
         log_session=TestLogSession(),
+        audio_source=audio_source,
     )
 
 
@@ -68,6 +79,44 @@ class CommandLineTests(unittest.TestCase):
         with redirect_stderr(StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--input-device", "-1"])
+
+    def test_accepts_a_wav_replay_path(self):
+        args = parse_args(["--replay", "session.wav"])
+
+        self.assertEqual(args.replay, "session.wav")
+
+    def test_replay_cannot_be_combined_with_benchmark_or_input_device(self):
+        for arguments in (
+            ["--replay", "session.wav", "--benchmark", "session.wav"],
+            ["--replay", "session.wav", "--input-device", "2"],
+        ):
+            with self.subTest(arguments=arguments):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_args(arguments)
+
+    def test_replay_builds_a_finite_source_for_the_live_pipeline(self):
+        source = Mock()
+        pipeline = Mock()
+        with (
+            patch("transcriber.load_runtime_config", return_value=RuntimeConfig()),
+            patch("transcriber.WavReplaySource", return_value=source) as source_type,
+            patch("transcriber.RealTimePipeline", return_value=pipeline) as pipeline_type,
+        ):
+            result = main(["--replay", "session.wav"])
+
+        self.assertEqual(result, 0)
+        source_type.assert_called_once_with(
+            "session.wav",
+            sample_rate=16000,
+            chunk_samples=1024,
+            realtime=True,
+        )
+        self.assertIs(pipeline_type.call_args.kwargs["audio_source"], source)
+        self.assertTrue(pipeline_type.call_args.kwargs["enable_vad"])
+        self.assertTrue(pipeline_type.call_args.kwargs["enable_osc"])
+        pipeline.start.assert_called_once_with()
+        pipeline.close.assert_called_once_with()
 
 
 class RealTimePipelineControlTests(unittest.TestCase):
@@ -132,6 +181,7 @@ class RealTimePipelineControlTests(unittest.TestCase):
 
         expected = {
             ("/audio_status", "ready"),
+            ("/audio_source", "microphone"),
             ("/audio_reconnects", 0),
             ("/audio_error", ""),
             ("/audio_device_index", 2),
@@ -267,6 +317,36 @@ class PipelineLifecycleTests(unittest.TestCase):
         crash = pipeline.runtime_logger.exception.call_args
         self.assertEqual(crash.kwargs["extra"]["event"], "worker_crashed")
         self.assertEqual(crash.kwargs["extra"]["worker"], "audio")
+        pipeline.close()
+
+
+class WavReplayPipelineTests(unittest.TestCase):
+    def test_finite_source_drains_the_final_segment_before_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.wav"
+            with wave.open(str(path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x10\x27" * 3200)
+            source = WavReplaySource(path, realtime=False)
+            adapter = make_backend_adapter()
+            pipeline = make_pipeline(
+                backend_adapter=adapter,
+                audio_source=source,
+            )
+            pipeline.vad = Mock()
+            pipeline.vad.is_speech.return_value = True
+
+            with redirect_stdout(StringIO()):
+                pipeline.start_worker_threads()
+                pipeline.join_worker_threads()
+
+        self.assertTrue(pipeline.audio_source_finished.is_set())
+        self.assertTrue(pipeline.stop_event.is_set())
+        adapter.transcribe.assert_called_once()
+        self.assertEqual(pipeline.last_text, "adapter transcript")
+        self.assertFalse(source._open)
         pipeline.close()
 
 
@@ -460,8 +540,21 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
 
 
 class MicrophoneRecoveryTests(unittest.TestCase):
-    def make_pipeline(self, config=None):
-        pipeline = make_pipeline(config)
+    @staticmethod
+    def make_source():
+        source = Mock()
+        source.kind = "microphone"
+        source.finite = False
+        source.reconnectable = True
+        source.device_index = 4
+        source.name = "Stage USB Microphone"
+        return source
+
+    def make_pipeline(self, config=None, source=None):
+        pipeline = make_pipeline(
+            config,
+            audio_source=source or self.make_source(),
+        )
         pipeline.send_runtime_status = Mock()
         pipeline.process_audio_data = Mock()
         pipeline.finalize_interrupted_audio = Mock()
@@ -469,33 +562,17 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         return pipeline
 
     @staticmethod
-    def make_audio_interface():
-        audio_interface = Mock()
-        audio_interface.terminate = Mock()
-        return audio_interface
-
-    @staticmethod
-    def make_stopping_stream(pipeline):
-        stream = Mock()
-
-        def read_once(*_args, **_kwargs):
+    def make_stopping_read(pipeline):
+        def read_once():
             pipeline.request_shutdown()
             return b"\x00\x00" * 16
-
-        stream.read.side_effect = read_once
-        return stream
+        return read_once
 
     def test_recovers_when_the_microphone_is_unavailable_at_startup(self):
-        pipeline = self.make_pipeline()
-        first_audio = self.make_audio_interface()
-        second_audio = self.make_audio_interface()
-        recovered_stream = self.make_stopping_stream(pipeline)
-        pipeline.create_audio_interface = Mock(
-            side_effect=[first_audio, second_audio]
-        )
-        pipeline.open_microphone_stream = Mock(
-            side_effect=[OSError("device unavailable"), recovered_stream]
-        )
+        source = self.make_source()
+        pipeline = self.make_pipeline(source=source)
+        source.open.side_effect = [OSError("device unavailable"), source]
+        source.read.side_effect = self.make_stopping_read(pipeline)
 
         with redirect_stdout(StringIO()):
             pipeline.audio_callback()
@@ -504,31 +581,29 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         self.assertEqual(pipeline.audio_status, "stopped")
         self.assertEqual(pipeline.last_audio_error, "")
         pipeline.process_audio_data.assert_called_once()
-        first_audio.terminate.assert_called_once()
-        second_audio.terminate.assert_called_once()
-        recovered_stream.close.assert_called_once()
+        self.assertEqual(source.open.call_count, 2)
+        self.assertEqual(source.close.call_count, 2)
 
     def test_reopens_the_stream_after_repeated_read_failures(self):
+        source = self.make_source()
         pipeline = self.make_pipeline(
-            replace(
-                RuntimeConfig(),
-                audio_max_consecutive_read_errors=2,
-            )
+            replace(RuntimeConfig(), audio_max_consecutive_read_errors=2),
+            source=source,
         )
-        first_audio = self.make_audio_interface()
-        second_audio = self.make_audio_interface()
-        failing_stream = Mock()
-        failing_stream.read.side_effect = [
-            OSError("input overflow"),
-            OSError("device disconnected"),
-        ]
-        recovered_stream = self.make_stopping_stream(pipeline)
-        pipeline.create_audio_interface = Mock(
-            side_effect=[first_audio, second_audio]
-        )
-        pipeline.open_microphone_stream = Mock(
-            side_effect=[failing_stream, recovered_stream]
-        )
+        source.open.return_value = source
+        read_count = 0
+
+        def read_with_recovery():
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                raise OSError("input overflow")
+            if read_count == 2:
+                raise OSError("device disconnected")
+            pipeline.request_shutdown()
+            return b"\x00\x00" * 16
+
+        source.read.side_effect = read_with_recovery
 
         with redirect_stdout(StringIO()):
             pipeline.audio_callback()
@@ -537,36 +612,8 @@ class MicrophoneRecoveryTests(unittest.TestCase):
         self.assertEqual(pipeline.audio_status, "stopped")
         pipeline.process_audio_data.assert_called_once()
         pipeline.finalize_interrupted_audio.assert_called_once()
-        failing_stream.close.assert_called_once()
-        recovered_stream.close.assert_called_once()
-
-    def test_missing_pyaudio_has_an_actionable_runtime_error(self):
-        pipeline = self.make_pipeline()
-
-        with patch("transcriber.pyaudio", None):
-            with self.assertRaisesRegex(RuntimeError, "--diagnose"):
-                pipeline.create_audio_interface()
-
-    def test_opens_the_selected_input_device(self):
-        pipeline = self.make_pipeline(
-            replace(RuntimeConfig(), audio_input_device_index=4)
-        )
-        audio_interface = Mock()
-        selected = SimpleNamespace(index=4, name="Stage USB Microphone")
-
-        with patch(
-            "transcriber.get_audio_input_device",
-            return_value=selected,
-        ) as resolve_device:
-            pipeline.open_microphone_stream(audio_interface)
-
-        resolve_device.assert_called_once_with(audio_interface, 4)
-        self.assertEqual(pipeline.audio_device_index, 4)
-        self.assertEqual(pipeline.audio_device_name, "Stage USB Microphone")
-        self.assertEqual(
-            audio_interface.open.call_args.kwargs["input_device_index"],
-            4,
-        )
+        self.assertEqual(source.open.call_count, 2)
+        self.assertEqual(source.close.call_count, 2)
 
 
 if __name__ == "__main__":
