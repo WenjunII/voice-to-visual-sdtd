@@ -1,5 +1,4 @@
 import os
-import wave
 import argparse
 import numpy as np
 import threading
@@ -10,8 +9,14 @@ import msvcrt
 from audio_runtime import (
     EnergyVoiceActivityDetector,
     SileroVoiceActivityDetector,
-    get_audio_input_device,
-    list_audio_input_devices,
+)
+from audio_sources import (
+    AudioSourceFinished,
+    AudioSourceStopped,
+    PyAudioSource,
+    WavReplaySource,
+    list_system_audio_input_devices,
+    load_wav_samples,
 )
 from backend_errors import RetryableTranscriptionError, exponential_backoff
 from diagnostics import run_diagnostics
@@ -29,11 +34,6 @@ from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
 from transcription_backends import create_transcription_backend
-
-try:
-    import pyaudio
-except ImportError:
-    pyaudio = None
 
 def optional_non_negative_int(value):
     if value is None or str(value).strip() == "":
@@ -66,10 +66,16 @@ def parse_args(args=None):
         action="store_true",
         help="List input-capable audio devices and exit."
     )
-    parser.add_argument(
+    runtime_mode = parser.add_mutually_exclusive_group()
+    runtime_mode.add_argument(
         "--benchmark",
         metavar="WAV_PATH",
         help="Benchmark a local backend with a PCM WAV file instead of opening the microphone."
+    )
+    runtime_mode.add_argument(
+        "--replay",
+        metavar="WAV_PATH",
+        help="Replay a PCM WAV file through the live segmentation, transcription, prompt, logging, and OSC pipeline."
     )
     parser.add_argument(
         "--benchmark-runs",
@@ -87,7 +93,10 @@ def parse_args(args=None):
         action="store_true",
         help="Validate and print the effective configuration with secrets redacted."
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if parsed.replay and parsed.input_device is not None:
+        parser.error("--input-device cannot be used with --replay")
+    return parsed
 
 
 def load_runtime_config(args=None):
@@ -185,20 +194,13 @@ KEYBOARD_CONTROLS = {
 
 # Audio recording constants
 CHUNK = 1024
-FORMAT = pyaudio.paInt16 if pyaudio is not None else None
 CHANNELS = 1
 RATE = 16000
 
 
 def print_audio_input_devices():
-    if pyaudio is None:
-        print("PyAudio is not installed; audio devices cannot be listed.")
-        return 1
-
-    audio_interface = None
     try:
-        audio_interface = pyaudio.PyAudio()
-        devices = list_audio_input_devices(audio_interface)
+        devices = list_system_audio_input_devices()
         if not devices:
             print("No input-capable audio devices were found.")
             return 1
@@ -218,9 +220,6 @@ def print_audio_input_devices():
     except Exception as exc:
         print(f"Could not enumerate audio devices: {exc}")
         return 1
-    finally:
-        if audio_interface is not None:
-            audio_interface.terminate()
 
 
 class RealTimePipeline:
@@ -233,6 +232,7 @@ class RealTimePipeline:
         config=None,
         backend_adapter=None,
         log_session=None,
+        audio_source=None,
     ):
         configure_dependency_environment()
         self.config = (
@@ -280,6 +280,19 @@ class RealTimePipeline:
         self._close_lock = threading.Lock()
         self._worker_threads = {}
         self._workers_started = False
+        self.audio_source = (
+            audio_source
+            if audio_source is not None
+            else PyAudioSource(
+                device_index=self.config.audio_input_device_index,
+                sample_rate=RATE,
+                chunk_samples=CHUNK,
+                channels=CHANNELS,
+            )
+        )
+        if hasattr(self.audio_source, "stop_event"):
+            self.audio_source.stop_event = self.stop_event
+        self.audio_source_finished = threading.Event()
         self.backend = self.backend_adapter.name
         self.last_online_request_time = 0
         self.last_whisper_request_time = 0
@@ -335,13 +348,8 @@ class RealTimePipeline:
         self.audio_status = "starting"
         self.audio_reconnects = 0
         self.last_audio_error = ""
-        configured_device = self.config.audio_input_device_index
-        self.audio_device_index = (
-            configured_device if configured_device is not None else -1
-        )
-        self.audio_device_name = (
-            "system default" if configured_device is None else ""
-        )
+        self.audio_device_index = self.audio_source.device_index
+        self.audio_device_name = self.audio_source.name
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
@@ -360,6 +368,7 @@ class RealTimePipeline:
             extra={
                 "event": "session_start",
                 "backend": self.backend,
+                "audio_source": self.audio_source.kind,
                 "log_file": (
                     str(self.log_session.path)
                     if self.log_session.path is not None
@@ -573,30 +582,6 @@ class RealTimePipeline:
             self.config.vad_energy_threshold
         )
 
-    def create_audio_interface(self):
-        if pyaudio is None:
-            raise RuntimeError(
-                "PyAudio is not installed. Run 'python transcriber.py --diagnose' "
-                "for setup details, then install the project requirements."
-            )
-        return pyaudio.PyAudio()
-
-    def open_microphone_stream(self, audio_interface):
-        device = get_audio_input_device(
-            audio_interface,
-            self.config.audio_input_device_index,
-        )
-        self.audio_device_index = device.index
-        self.audio_device_name = device.name
-        return audio_interface.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            input_device_index=device.index,
-            frames_per_buffer=CHUNK,
-        )
-
     def process_audio_data(self, data):
         audio_data = np.frombuffer(data, dtype=np.int16)
         try:
@@ -637,23 +622,6 @@ class RealTimePipeline:
     def wait_for_audio_retry(self, delay_seconds):
         return not self.stop_event.wait(max(0.0, delay_seconds))
 
-    @staticmethod
-    def close_audio_session(stream, audio_interface):
-        if stream is not None:
-            try:
-                stream.stop_stream()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
-        if audio_interface is not None:
-            try:
-                audio_interface.terminate()
-            except Exception:
-                pass
-
     def finalize_interrupted_audio(self):
         with self.lock:
             segment = self.segmenter.interrupt()
@@ -670,20 +638,24 @@ class RealTimePipeline:
 
     def audio_callback(self):
         reconnect_attempt = 0
+        source = self.audio_source
 
         while self.is_running:
-            audio_interface = None
-            stream = None
+            opened = False
+            finished = False
             failure = None
             try:
-                audio_interface = self.create_audio_interface()
-                stream = self.open_microphone_stream(audio_interface)
+                source.open()
+                opened = True
+                self.audio_device_index = source.device_index
+                self.audio_device_name = source.name
 
                 if self.audio_reconnects:
                     self.audio_logger.info(
-                        "Microphone connection recovered",
+                        "Audio source connection recovered",
                         extra={
                             "event": "audio_recovered",
+                            "source_kind": source.kind,
                             "device_index": self.audio_device_index,
                             "device_name": self.audio_device_name,
                             "reconnects": self.audio_reconnects,
@@ -691,9 +663,10 @@ class RealTimePipeline:
                     )
                 else:
                     self.audio_logger.info(
-                        "Microphone stream opened",
+                        "Audio source opened",
                         extra={
                             "event": "audio_stream_opened",
+                            "source_kind": source.kind,
                             "device_index": self.audio_device_index,
                             "device_name": self.audio_device_name,
                         },
@@ -705,7 +678,22 @@ class RealTimePipeline:
                 consecutive_read_errors = 0
                 while self.is_running:
                     try:
-                        data = stream.read(CHUNK, exception_on_overflow=False)
+                        data = source.read()
+                    except AudioSourceFinished:
+                        self.finalize_interrupted_audio()
+                        self.audio_source_finished.set()
+                        finished = True
+                        self.audio_logger.info(
+                            "Finite audio source completed",
+                            extra={
+                                "event": "audio_source_completed",
+                                "source_kind": source.kind,
+                                "source_name": source.name,
+                            },
+                        )
+                        break
+                    except AudioSourceStopped:
+                        break
                     except Exception as exc:
                         consecutive_read_errors += 1
                         self.audio_status = "degraded"
@@ -716,15 +704,20 @@ class RealTimePipeline:
                         max_read_errors = (
                             self.config.audio_max_consecutive_read_errors
                         )
-                        if consecutive_read_errors >= max_read_errors:
+                        if (
+                            not source.reconnectable
+                            or consecutive_read_errors >= max_read_errors
+                        ):
                             raise RuntimeError(
-                                f"microphone read failed {consecutive_read_errors} consecutive times: {exc}"
+                                "audio source read failed "
+                                f"{consecutive_read_errors} consecutive times: {exc}"
                             ) from exc
 
                         self.audio_logger.warning(
-                            "Microphone read failed; retrying current stream",
+                            "Audio source read failed; retrying current stream",
                             extra={
                                 "event": "audio_read_error",
+                                "source_kind": source.kind,
                                 "error": self.clean_audio_error(exc),
                                 "consecutive_errors": consecutive_read_errors,
                                 "max_consecutive_errors": max_read_errors,
@@ -738,8 +731,11 @@ class RealTimePipeline:
 
                     if consecutive_read_errors:
                         self.audio_logger.info(
-                            "Microphone reads resumed",
-                            extra={"event": "audio_reads_resumed"},
+                            "Audio source reads resumed",
+                            extra={
+                                "event": "audio_reads_resumed",
+                                "source_kind": source.kind,
+                            },
                         )
                         self.audio_status = "ready"
                         self.last_audio_error = ""
@@ -759,22 +755,26 @@ class RealTimePipeline:
             except Exception as exc:
                 failure = exc
             finally:
-                self.close_audio_session(stream, audio_interface)
+                source.close()
 
-            if failure is None or not self.is_running:
+            if finished or failure is None or not self.is_running:
                 break
 
-            if stream is not None:
+            if opened:
                 self.finalize_interrupted_audio()
             self.is_speaking = False
             self.last_audio_error = self.clean_audio_error(failure)
-            if not self.config.audio_reconnect_enabled:
+            if (
+                not source.reconnectable
+                or not self.config.audio_reconnect_enabled
+            ):
                 self.audio_status = "error"
                 self.request_shutdown()
                 self.audio_logger.error(
-                    "Microphone failed and automatic reconnection is disabled",
+                    "Audio source failed and cannot reconnect",
                     extra={
                         "event": "audio_terminal_error",
+                        "source_kind": source.kind,
                         "error": self.clean_audio_error(failure),
                     },
                 )
@@ -790,9 +790,10 @@ class RealTimePipeline:
             self.audio_reconnects += 1
             self.audio_status = "reconnecting"
             self.audio_logger.warning(
-                "Microphone unavailable; scheduling reconnect",
+                "Audio source unavailable; scheduling reconnect",
                 extra={
                     "event": "audio_reconnect_scheduled",
+                    "source_kind": source.kind,
                     "error": self.clean_audio_error(failure),
                     "retry_in_seconds": retry_delay,
                     "attempt": self.audio_reconnects,
@@ -806,9 +807,10 @@ class RealTimePipeline:
             self.audio_status = "stopped"
             self.is_speaking = False
             self.audio_logger.info(
-                "Microphone capture stopped",
+                "Audio capture stopped",
                 extra={
                     "event": "audio_stopped",
+                    "source_kind": source.kind,
                     "reconnects": self.audio_reconnects,
                 },
             )
@@ -821,6 +823,12 @@ class RealTimePipeline:
     def transcription_loop(self):
         while self.is_running:
             now = time.monotonic()
+            if (
+                self.audio_source_finished.is_set()
+                and self.scheduler.metrics(now).queue_depth == 0
+            ):
+                self.request_shutdown("audio_source_completed")
+                break
             if not self.request_interval_ready(now):
                 self.send_runtime_status()
                 if self.stop_event.wait(0.05):
@@ -1018,6 +1026,7 @@ class RealTimePipeline:
                 metrics.dropped_stale + metrics.dropped_finals,
             )
             self.osc_client.send_message("/audio_status", self.audio_status)
+            self.osc_client.send_message("/audio_source", self.audio_source.kind)
             self.osc_client.send_message("/audio_reconnects", self.audio_reconnects)
             self.osc_client.send_message("/audio_error", self.last_audio_error)
             self.osc_client.send_message("/audio_device_index", self.audio_device_index)
@@ -1209,7 +1218,10 @@ class RealTimePipeline:
         if self.backend not in {"whisper", "faster_whisper"}:
             raise RuntimeError("Benchmark mode supports only whisper and faster_whisper backends.")
 
-        samples = self.load_wav_file(wav_path)
+        samples = load_wav_samples(
+            wav_path,
+            target_sample_rate=RATE,
+        )
         audio_seconds = len(samples) / RATE
         runs = max(1, runs)
         warmup = samples[:min(len(samples), int(2 * RATE))]
@@ -1245,30 +1257,6 @@ class RealTimePipeline:
         average = sum(latencies) / len(latencies)
         print(f"Average: {average:.3f}s | real-time factor {average / audio_seconds:.3f}")
         print("=" * 50)
-
-    @staticmethod
-    def load_wav_file(wav_path):
-        with wave.open(wav_path, "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            source_rate = wav_file.getframerate()
-            frame_count = wav_file.getnframes()
-            raw_audio = wav_file.readframes(frame_count)
-
-        if sample_width != 2:
-            raise ValueError("Benchmark WAV must use 16-bit PCM audio.")
-
-        samples = np.frombuffer(raw_audio, dtype=np.int16)
-        if channels > 1:
-            samples = samples.reshape(-1, channels).astype(np.int32).mean(axis=1).astype(np.int16)
-        if source_rate != RATE:
-            target_length = max(1, round(len(samples) * RATE / source_rate))
-            source_positions = np.linspace(0, len(samples) - 1, num=len(samples))
-            target_positions = np.linspace(0, len(samples) - 1, num=target_length)
-            samples = np.interp(target_positions, source_positions, samples).astype(np.int16)
-        if samples.size == 0:
-            raise ValueError("Benchmark WAV contains no audio samples.")
-        return samples
 
     def start_osc_control_server(self):
         if not self.osc_control_enabled:
@@ -1371,6 +1359,10 @@ class RealTimePipeline:
                 f"VAD: {self.config.vad_engine} | "
                 f"CONFIRMATIONS: {self.config.transcript_confirm_updates}"
             )
+            print(
+                f"AUDIO SOURCE: {self.audio_source.name} "
+                f"({self.audio_source.kind})"
+            )
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")
             print("  [AGE]    '1' -> Young | '2' -> Adult | '3' -> Elder")
@@ -1440,6 +1432,7 @@ class RealTimePipeline:
                     extra={
                         "event": "session_stop",
                         "backend": self.backend,
+                        "audio_source": self.audio_source.kind,
                         "audio_reconnects": self.audio_reconnects,
                         "processed_jobs": metrics.processed,
                         "failed_jobs": metrics.failed,
@@ -1475,12 +1468,26 @@ def main(argv=None):
             device=config.whisper_device or "cuda",
         )
 
+    audio_source = None
+    if args.replay:
+        try:
+            audio_source = WavReplaySource(
+                args.replay,
+                sample_rate=RATE,
+                chunk_samples=CHUNK,
+                realtime=True,
+            )
+        except ValueError as exc:
+            print(f"Invalid replay audio: {exc}")
+            return 2
+
     pipeline = RealTimePipeline(
         enable_vad=not bool(args.benchmark),
         enable_osc=not bool(args.benchmark),
         enable_prompt_budget=not bool(args.benchmark),
         enable_osc_controls=not bool(args.benchmark),
         config=config,
+        audio_source=audio_source,
     )
     try:
         if args.benchmark:
