@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from audio_sources import WavReplaySource
 from backend_errors import RetryableTranscriptionError
+from osc_output import RecordingOutputPublisher
 from runtime_config import RuntimeConfig
 from transcriber import RealTimePipeline, main, parse_args
 
@@ -47,6 +48,7 @@ def make_pipeline(
     online=False,
     backend_adapter=None,
     audio_source=None,
+    output_publisher=None,
 ):
     return RealTimePipeline(
         enable_vad=False,
@@ -61,6 +63,7 @@ def make_pipeline(
         ),
         log_session=TestLogSession(),
         audio_source=audio_source,
+        output_publisher=output_publisher,
     )
 
 
@@ -121,7 +124,9 @@ class CommandLineTests(unittest.TestCase):
 
 class RealTimePipelineControlTests(unittest.TestCase):
     def make_pipeline(self):
-        pipeline = make_pipeline()
+        publisher = RecordingOutputPublisher()
+        pipeline = make_pipeline(output_publisher=publisher)
+        pipeline.recording_publisher = publisher
         pipeline.last_text = "a city glowing after rain"
         pipeline.last_prompt_token_count = 42
         pipeline.audio_status = "ready"
@@ -129,7 +134,6 @@ class RealTimePipelineControlTests(unittest.TestCase):
         pipeline.audio_device_name = "USB Microphone"
         pipeline.last_total_latency = 0.25
         pipeline.last_inference_latency = 0.2
-        pipeline.osc_client = Mock()
         return pipeline
 
     def test_visual_control_refreshes_the_current_prompt_immediately(self):
@@ -144,18 +148,22 @@ class RealTimePipelineControlTests(unittest.TestCase):
         pipeline.build_visual_prompt.assert_called_once_with(
             "a city glowing after rain"
         )
-        pipeline.osc_client.send_message.assert_any_call(
-            "/control_ack",
-            "visual_mode:black_brown",
+        messages = [
+            (message.address, message.value)
+            for message in pipeline.recording_publisher.messages
+        ]
+        self.assertIn(
+            ("/control_ack", "visual_mode:black_brown"),
+            messages,
         )
         prompt_messages = [
-            call.args[1]
-            for call in pipeline.osc_client.send_message.call_args_list
-            if call.args[0] == "/prompt"
+            value
+            for address, value in messages
+            if address == "/prompt"
         ]
         self.assertEqual(len(prompt_messages), 1)
         self.assertIn("adult Black or Brown person", prompt_messages[0])
-        pipeline.osc_client.send_message.assert_any_call("/prompt_tokens", 0)
+        self.assertIn(("/prompt_tokens", 0), messages)
         pipeline.send_runtime_status.assert_called_once_with(force=True)
 
     def test_language_control_does_not_rebuild_the_visual_prompt(self):
@@ -193,8 +201,8 @@ class RealTimePipelineControlTests(unittest.TestCase):
             ("/language", "zh"),
         }
         calls = {
-            tuple(call.args)
-            for call in pipeline.osc_client.send_message.call_args_list
+            (message.address, message.value)
+            for message in pipeline.recording_publisher.messages
         }
         self.assertTrue(expected.issubset(calls))
 
@@ -230,11 +238,17 @@ class BackendAdapterIntegrationTests(unittest.TestCase):
         self.assertEqual(pipeline.local_request_interval(), 0.0)
 
     def test_closes_the_backend_adapter(self):
-        pipeline, adapter = self.make_pipeline()
+        publisher = Mock()
+        pipeline = make_pipeline(
+            backend_adapter=make_backend_adapter(online=True),
+            output_publisher=publisher,
+        )
+        adapter = pipeline.backend_adapter
 
         pipeline.close()
         pipeline.close()
 
+        publisher.close.assert_called_once_with()
         adapter.close.assert_called_once_with()
 
 
@@ -331,9 +345,11 @@ class WavReplayPipelineTests(unittest.TestCase):
                 wav_file.writeframes(b"\x10\x27" * 3200)
             source = WavReplaySource(path, realtime=False)
             adapter = make_backend_adapter()
+            publisher = RecordingOutputPublisher()
             pipeline = make_pipeline(
                 backend_adapter=adapter,
                 audio_source=source,
+                output_publisher=publisher,
             )
             pipeline.vad = Mock()
             pipeline.vad.is_speech.return_value = True
@@ -347,6 +363,31 @@ class WavReplayPipelineTests(unittest.TestCase):
         adapter.transcribe.assert_called_once()
         self.assertEqual(pipeline.last_text, "adapter transcript")
         self.assertFalse(source._open)
+        transcript_messages = [
+            (message.address, message.value)
+            for message in publisher.messages
+            if message.address
+            in {
+                "/prompt",
+                "/partial_text",
+                "/scene_context",
+                "/prompt_tokens",
+                "/transcript_final",
+            }
+        ]
+        self.assertEqual(
+            [address for address, _value in transcript_messages],
+            [
+                "/prompt",
+                "/partial_text",
+                "/scene_context",
+                "/prompt_tokens",
+                "/transcript_final",
+            ],
+        )
+        self.assertEqual(transcript_messages[1][1], "adapter transcript")
+        self.assertEqual(transcript_messages[2][1], "adapter transcript")
+        self.assertEqual(transcript_messages[4][1], "adapter transcript")
         pipeline.close()
 
 
@@ -411,7 +452,12 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             osc_control_enabled=False,
         )
 
-        with patch("transcriber.udp_client.SimpleUDPClient") as client:
+        first_publisher = Mock()
+        second_publisher = Mock()
+        with patch(
+            "transcriber.OscOutputPublisher",
+            side_effect=[first_publisher, second_publisher],
+        ) as publisher_type:
             first = RealTimePipeline(
                 enable_vad=False,
                 enable_osc=True,
@@ -431,10 +477,16 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
                 log_session=TestLogSession(),
             )
 
-        self.assertEqual(
-            [call.args for call in client.call_args_list],
-            [("127.0.0.2", 7100), ("127.0.0.3", 7200)],
-        )
+        self.assertEqual(publisher_type.call_count, 2)
+        first_call, second_call = publisher_type.call_args_list
+        self.assertEqual(first_call.args, ("127.0.0.2", 7100))
+        self.assertEqual(second_call.args, ("127.0.0.3", 7200))
+        self.assertEqual(first_call.kwargs["status_interval"], 0.5)
+        self.assertEqual(first_call.kwargs["error_log_interval"], 5.0)
+        self.assertIs(first_call.kwargs["logger"], first.osc_logger)
+        self.assertIs(second_call.kwargs["logger"], second.osc_logger)
+        self.assertIs(first.output_publisher, first_publisher)
+        self.assertIs(second.output_publisher, second_publisher)
         self.assertTrue(first.osc_control_enabled)
         self.assertFalse(second.osc_control_enabled)
 

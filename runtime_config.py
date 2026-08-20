@@ -162,6 +162,9 @@ class RuntimeConfig:
     osc_control_ip: str = _config_field("OSC_CONTROL_IP", "127.0.0.1")
     osc_control_port: int = _config_field("OSC_CONTROL_PORT", 7001)
     osc_status_interval: float = _config_field("OSC_STATUS_INTERVAL", 0.5)
+    osc_output_error_log_interval: float = _config_field(
+        "OSC_OUTPUT_ERROR_LOG_INTERVAL", 5.0
+    )
 
     runtime_log_level: str = _config_field("RUNTIME_LOG_LEVEL", "info")
     runtime_log_console_enabled: bool = _config_field(
@@ -376,6 +379,9 @@ class RuntimeConfig:
                 "FASTER_WHISPER_NUM_WORKERS": self.faster_whisper_num_workers,
                 "PROMPT_MAX_TOKENS": self.prompt_max_tokens,
                 "OSC_STATUS_INTERVAL": self.osc_status_interval,
+                "OSC_OUTPUT_ERROR_LOG_INTERVAL": (
+                    self.osc_output_error_log_interval
+                ),
                 "RUNTIME_LOG_MAX_BYTES": self.runtime_log_max_bytes,
                 "RUNTIME_LOG_BACKUP_COUNT": self.runtime_log_backup_count,
                 "RUNTIME_SHUTDOWN_GRACE_SECONDS": (
