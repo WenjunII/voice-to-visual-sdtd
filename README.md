@@ -22,6 +22,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
+- **Resilient OSC Output**: Isolates UDP delivery failures from audio and transcription, rate-limits outage logs, reports recovery, and exposes an in-memory publisher for deterministic protocol and replay tests.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
 - **Structured Session Logging**: Labels operational events by subsystem, captures latency/retry/reconnection metrics, optionally rotates JSON Lines log files, and redacts configured credentials.
@@ -178,6 +179,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     OSC_CONTROL_IP=127.0.0.1
     OSC_CONTROL_PORT=7001
     OSC_STATUS_INTERVAL=0.5
+    OSC_OUTPUT_ERROR_LOG_INTERVAL=5.0
 
     # Human-readable operational console logs and optional rotating JSON Lines files.
     RUNTIME_LOG_LEVEL=info
@@ -318,6 +320,8 @@ RUNTIME_SHUTDOWN_GRACE_SECONDS=25.0
 
 The file rotates before exceeding the configured size and retains the configured number of backups. Each record contains a timestamp, session ID, subsystem, event name, level, message, and relevant metrics. Raw prompt and transcript text remains in the live console instead of the operational file, and configured API keys plus bearer credentials are replaced with `<redacted>`.
 
+OSC delivery failures produce a rate-limited `osc_output_error` event without including the prompt or transcript value. Audio capture and transcription continue while TouchDesigner or the network is unavailable, and the first successful send records `osc_output_recovered`. Set `OSC_OUTPUT_ERROR_LOG_INTERVAL` to control the minimum number of seconds between outage warnings.
+
 ### Graceful Shutdown
 
 Ctrl+C and terminal audio failures signal the audio and transcription workers through a shared cancellation event. Retry and idle waits wake immediately, the OSC control server stops accepting changes, and the runtime waits for in-flight work before closing the transcription backend and log session.
@@ -353,6 +357,8 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 | `/prompt_style` | Active human-focus or general-scene mode |
 | `/language` | Active language code or `auto` |
 
+Status is captured as one immutable runtime snapshot before it is serialized in the stable address order above. Individual UDP send failures are contained at the output boundary, so they do not stop the audio or transcription workers.
+
 ### OSC Input from TouchDesigner
 
 Send these messages to `127.0.0.1:7001`. Text values accept the names below or the equivalent keyboard key.
@@ -379,6 +385,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
+- `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, outage/recovery logging, and in-memory test publisher.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.
 - `diagnostics.py` owns the read-only startup health checks.
 - `transcript_filter.py` conservatively removes known standalone Whisper hallucinations.
@@ -402,7 +409,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, WAV conversion and replay, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 

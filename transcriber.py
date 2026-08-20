@@ -3,7 +3,6 @@ import argparse
 import numpy as np
 import threading
 import time
-from pythonosc import udp_client
 import msvcrt
 
 from audio_runtime import (
@@ -21,6 +20,11 @@ from audio_sources import (
 from backend_errors import RetryableTranscriptionError, exponential_backoff
 from diagnostics import run_diagnostics
 from osc_control import OscControlServer
+from osc_output import (
+    NullOutputPublisher,
+    OscOutputPublisher,
+    RuntimeStatusSnapshot,
+)
 from prompt_engine import PromptBudgeter, RollingSceneMemory
 from runtime_config import (
     ConfigError,
@@ -233,6 +237,7 @@ class RealTimePipeline:
         backend_adapter=None,
         log_session=None,
         audio_source=None,
+        output_publisher=None,
     ):
         configure_dependency_environment()
         self.config = (
@@ -298,13 +303,22 @@ class RealTimePipeline:
         self.last_whisper_request_time = 0
         self.backend_retry_not_before = 0.0
 
-        self.osc_client = (
-            udp_client.SimpleUDPClient(
-                self.config.osc_ip,
-                self.config.osc_port,
+        self.output_publisher = (
+            output_publisher
+            if output_publisher is not None
+            else (
+                OscOutputPublisher(
+                    self.config.osc_ip,
+                    self.config.osc_port,
+                    status_interval=self.config.osc_status_interval,
+                    error_log_interval=(
+                        self.config.osc_output_error_log_interval
+                    ),
+                    logger=self.osc_logger,
+                )
+                if enable_osc
+                else NullOutputPublisher()
             )
-            if enable_osc
-            else None
         )
         self.osc_control_enabled = bool(
             enable_osc_controls and self.config.osc_control_enabled
@@ -353,7 +367,6 @@ class RealTimePipeline:
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
-        self.last_status_osc_time = 0.0
         self.current_gender = CURRENT_GENDER
         self.current_age = CURRENT_AGE
         self.current_visual_mode = CURRENT_VISUAL_MODE
@@ -362,7 +375,6 @@ class RealTimePipeline:
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.scene_lock = threading.Lock()
-        self.osc_lock = threading.Lock()
         self.runtime_logger.info(
             "Runtime session initialized",
             extra={
@@ -988,14 +1000,9 @@ class RealTimePipeline:
             self.stabilizers.pop(job.segment.segment_id, None)
 
     def send_osc_message(self, address, value):
-        if self.osc_client is None:
-            return
-        with self.osc_lock:
-            self.osc_client.send_message(address, value)
+        return self.output_publisher.send(address, value)
 
     def send_runtime_status(self, force=False):
-        if self.osc_client is None:
-            return
         now = time.monotonic()
         with self.state_lock:
             current_gender = self.current_gender
@@ -1003,40 +1010,34 @@ class RealTimePipeline:
             current_visual_mode = self.current_visual_mode
             current_prompt_style = self.current_prompt_style
             current_language = self.current_language or "auto"
-        with self.osc_lock:
-            if (
-                not force
-                and now - self.last_status_osc_time
-                < self.config.osc_status_interval
-            ):
-                return
-            metrics = self.scheduler.metrics(now)
-            self.osc_client.send_message("/backend_status", self.backend_status)
-            self.osc_client.send_message("/backend", self.backend)
-            self.osc_client.send_message("/is_speaking", int(self.is_speaking))
-            self.osc_client.send_message("/queue_depth", metrics.queue_depth)
-            self.osc_client.send_message("/latency_total", float(self.last_total_latency))
-            self.osc_client.send_message("/latency_asr", float(self.last_inference_latency))
-            self.osc_client.send_message(
-                "/retry_in",
-                float(max(0.0, self.backend_retry_not_before - now)),
-            )
-            self.osc_client.send_message(
-                "/dropped_jobs",
-                metrics.dropped_stale + metrics.dropped_finals,
-            )
-            self.osc_client.send_message("/audio_status", self.audio_status)
-            self.osc_client.send_message("/audio_source", self.audio_source.kind)
-            self.osc_client.send_message("/audio_reconnects", self.audio_reconnects)
-            self.osc_client.send_message("/audio_error", self.last_audio_error)
-            self.osc_client.send_message("/audio_device_index", self.audio_device_index)
-            self.osc_client.send_message("/audio_device_name", self.audio_device_name)
-            self.osc_client.send_message("/gender", current_gender)
-            self.osc_client.send_message("/age", current_age)
-            self.osc_client.send_message("/visual_mode", current_visual_mode)
-            self.osc_client.send_message("/prompt_style", current_prompt_style)
-            self.osc_client.send_message("/language", current_language)
-            self.last_status_osc_time = now
+        metrics = self.scheduler.metrics(now)
+        snapshot = RuntimeStatusSnapshot(
+            backend_status=self.backend_status,
+            backend=self.backend,
+            is_speaking=self.is_speaking,
+            queue_depth=metrics.queue_depth,
+            latency_total=self.last_total_latency,
+            latency_asr=self.last_inference_latency,
+            retry_in=max(0.0, self.backend_retry_not_before - now),
+            dropped_jobs=(
+                metrics.dropped_stale + metrics.dropped_finals
+            ),
+            audio_status=self.audio_status,
+            audio_source=self.audio_source.kind,
+            audio_reconnects=self.audio_reconnects,
+            audio_error=self.last_audio_error,
+            audio_device_index=self.audio_device_index,
+            audio_device_name=self.audio_device_name,
+            gender=current_gender,
+            age=current_age,
+            visual_mode=current_visual_mode,
+            prompt_style=current_prompt_style,
+            language=current_language,
+        )
+        return self.output_publisher.publish_status(
+            snapshot,
+            force=force,
+        )
 
     def selected_language(self):
         with self.state_lock:
@@ -1422,6 +1423,7 @@ class RealTimePipeline:
             if self._workers_started:
                 self.send_runtime_status(force=True)
 
+            self.output_publisher.close()
             self._backend_closed = True
             try:
                 self.backend_adapter.close()

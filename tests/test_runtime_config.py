@@ -22,6 +22,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.transcription_backend, "whisper")
         self.assertEqual(config.osc_port, 7000)
         self.assertTrue(config.osc_control_enabled)
+        self.assertEqual(config.osc_output_error_log_interval, 5.0)
         self.assertEqual(config.runtime_log_level, "info")
         self.assertTrue(config.runtime_log_console_enabled)
         self.assertEqual(config.runtime_log_file, "")
@@ -88,6 +89,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     "RUNTIME_LOG_MAX_BYTES": "0",
                     "RUNTIME_LOG_BACKUP_COUNT": "-1",
                     "RUNTIME_SHUTDOWN_GRACE_SECONDS": "0",
+                    "OSC_OUTPUT_ERROR_LOG_INTERVAL": "0",
                 }
             )
 
@@ -118,6 +120,10 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertIn(
             "RUNTIME_SHUTDOWN_GRACE_SECONDS must be greater than 0",
+            errors,
+        )
+        self.assertIn(
+            "OSC_OUTPUT_ERROR_LOG_INTERVAL must be greater than 0",
             errors,
         )
 
