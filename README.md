@@ -7,6 +7,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Cultural Fusion Generation**: Fixed Prompt Template with live visual identity modes for Asian-American visuals, Black and Brown people visuals, or combined Asian + Black and Brown visuals.
 - **Live Prompt Style Selection**: Switch between the original human figure focus and a general scene template with no central human figure.
 - **Live Gender, Age & Visual Identity Selection**: Interactive keyboard and OSC controls toggle the subject's identity (Man/Woman, Young/Adult/Elder), prompt style, and visual representation mode. Visual changes immediately rebuild the active prompt without waiting for more speech.
+- **Configurable Startup Controls**: Persist the initial gender, age, visual identity, prompt style, and language in `.env`, or override the complete profile for one run from the command line.
 - **Stable Streaming Transcription**: Confirms the word prefix shared by consecutive hypotheses, reducing repeated text and prompt flicker.
 - **Conservative Hallucination Filtering**: Removes standalone Whisper outro artifacts such as “thanks for watching” without discarding real sentences that merely contain similar words.
 - **Rolling Scene Memory**: Removes overlap between audio segments and carries the newest subjects, places, and actions across prompt updates.
@@ -59,7 +60,7 @@ environment-focused composition, no central human figure, no portrait framing, 8
 
 ## Interactive Controls
 
-While `transcriber.py` is running, you can use the following keyboard shortcuts to adjust the visuals live:
+Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_VISUAL_MODE`, `DEFAULT_PROMPT_STYLE`, and `DEFAULT_LANGUAGE` in `.env`. The command-line equivalents override `.env` for one run. While `transcriber.py` is running, the following keyboard shortcuts and the OSC controls below can still adjust the active profile live:
 
 | Category | Key | Action |
 | :--- | :--- | :--- |
@@ -172,6 +173,13 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     TRANSCRIPTION_RETRY_BASE_SECONDS=1.0
     TRANSCRIPTION_RETRY_MAX_SECONDS=10.0
 
+    # Initial control profile. Live keyboard and OSC controls still apply.
+    DEFAULT_GENDER=neutral
+    DEFAULT_AGE=adult
+    DEFAULT_VISUAL_MODE=asian_american
+    DEFAULT_PROMPT_STYLE=human_focus
+    DEFAULT_LANGUAGE=auto
+
     # OSC output and optional OSC controls/status for TouchDesigner.
     OSC_IP=127.0.0.1
     OSC_PORT=7000
@@ -255,7 +263,7 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     ```powershell
     python transcriber.py --check-config
     ```
-    Command-line `--backend` and `--input-device` overrides are included in the displayed effective configuration.
+    Command-line backend, input-device, and startup-control overrides are included in the displayed effective configuration.
 2.  **Check the machine once after setup or dependency changes**:
     ```powershell
     python transcriber.py --diagnose
@@ -279,6 +287,12 @@ While `transcriber.py` is running, you can use the following keyboard shortcuts 
     python transcriber.py --backend groq
     python transcriber.py --backend groq_hybrid
     ```
+    To override the startup control profile for one run:
+    ```powershell
+    python transcriber.py --gender woman --age elder --visual-mode black_brown --prompt-style general_scene --language es
+    ```
+    Accepted values are `man|neutral|woman`, `adult|elder|young`, `asian_american|asian_black_brown|black_brown`, `general_scene|human_focus`, and `auto|en|es|zh`, respectively. Invalid `.env` values are reported together by `--check-config`; invalid command-line values are rejected before startup.
+
     `faster_whisper` uses CTranslate2 on the CUDA GPU and is the recommended local mode when StreamDiffusion shares the same GPU. `whisper` preserves the original OpenAI Whisper CUDA implementation. Both auto-detect multilingual audio and use Whisper's `translate` task to produce English. `groq` uses online multilingual translation and does not load local Whisper. `groq_hybrid` uses Groq turbo for online transcription, then translates non-English text locally on CPU with Argos Translate when available. If local translation is unavailable or still returns Chinese/Cantonese text, `HYBRID_TRANSLATION_FALLBACK=groq_text` sends only the transcript text through a fast Groq chat model for English cleanup.
 
     The dependency file pins CTranslate2 `4.4.0` for this project's current Windows CUDA 12 + cuDNN 8 setup. Silero VAD runs on the CPU. If Silero cannot load, the script reports the problem and automatically uses the energy detector.
@@ -409,7 +423,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration isolation, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration and startup-profile isolation, command-line precedence, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
 
 ## License
 

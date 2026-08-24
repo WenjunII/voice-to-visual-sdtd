@@ -28,6 +28,11 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.runtime_log_file, "")
         self.assertEqual(config.runtime_shutdown_grace_seconds, 25.0)
         self.assertEqual(config.audio_input_device_index, None)
+        self.assertEqual(config.default_gender, "neutral")
+        self.assertEqual(config.default_age, "adult")
+        self.assertEqual(config.default_visual_mode, "asian_american")
+        self.assertEqual(config.default_prompt_style, "human_focus")
+        self.assertEqual(config.default_language, "auto")
         self.assertEqual(
             config.prompt_tokenizer_models,
             (
@@ -50,13 +55,80 @@ class RuntimeConfigTests(unittest.TestCase):
                 "TRANSCRIPTION_BACKEND": "whisper",
                 "AUDIO_INPUT_DEVICE_INDEX": "2",
                 "GROQ_API_KEY": "test-key",
+                "DEFAULT_GENDER": "neutral",
+                "DEFAULT_AGE": "adult",
+                "DEFAULT_VISUAL_MODE": "asian_american",
+                "DEFAULT_PROMPT_STYLE": "human_focus",
+                "DEFAULT_LANGUAGE": "auto",
             },
             backend_override="groq",
             input_device_override=7,
+            gender_override="woman",
+            age_override="elder",
+            visual_mode_override="black_brown",
+            prompt_style_override="general_scene",
+            language_override="zh",
         )
 
         self.assertEqual(config.transcription_backend, "groq")
         self.assertEqual(config.audio_input_device_index, 7)
+        self.assertEqual(config.default_gender, "woman")
+        self.assertEqual(config.default_age, "elder")
+        self.assertEqual(config.default_visual_mode, "black_brown")
+        self.assertEqual(config.default_prompt_style, "general_scene")
+        self.assertEqual(config.default_language, "zh")
+
+    def test_normalizes_startup_control_environment_values(self):
+        config = RuntimeConfig.from_environment(
+            {
+                "DEFAULT_GENDER": "WOMAN",
+                "DEFAULT_AGE": "ELDER",
+                "DEFAULT_VISUAL_MODE": "BLACK_BROWN",
+                "DEFAULT_PROMPT_STYLE": "GENERAL_SCENE",
+                "DEFAULT_LANGUAGE": "ES",
+            }
+        )
+
+        self.assertEqual(config.default_gender, "woman")
+        self.assertEqual(config.default_age, "elder")
+        self.assertEqual(config.default_visual_mode, "black_brown")
+        self.assertEqual(config.default_prompt_style, "general_scene")
+        self.assertEqual(config.default_language, "es")
+
+    def test_rejects_invalid_startup_controls_together(self):
+        with self.assertRaises(ConfigError) as context:
+            RuntimeConfig.from_environment(
+                {
+                    "DEFAULT_GENDER": "robot",
+                    "DEFAULT_AGE": "ancient",
+                    "DEFAULT_VISUAL_MODE": "unknown",
+                    "DEFAULT_PROMPT_STYLE": "abstract",
+                    "DEFAULT_LANGUAGE": "fr",
+                }
+            )
+
+        errors = context.exception.errors
+        self.assertIn(
+            "DEFAULT_GENDER must be one of: man, neutral, woman",
+            errors,
+        )
+        self.assertIn(
+            "DEFAULT_AGE must be one of: adult, elder, young",
+            errors,
+        )
+        self.assertIn(
+            "DEFAULT_VISUAL_MODE must be one of: "
+            "asian_american, asian_black_brown, black_brown",
+            errors,
+        )
+        self.assertIn(
+            "DEFAULT_PROMPT_STYLE must be one of: general_scene, human_focus",
+            errors,
+        )
+        self.assertIn(
+            "DEFAULT_LANGUAGE must be one of: auto, en, es, zh",
+            errors,
+        )
 
     def test_rejects_malformed_numbers_and_booleans(self):
         with self.assertRaises(ConfigError) as context:
