@@ -29,6 +29,11 @@ from prompt_engine import PromptBudgeter, RollingSceneMemory
 from runtime_config import (
     ConfigError,
     RuntimeConfig,
+    SUPPORTED_AGES,
+    SUPPORTED_GENDERS,
+    SUPPORTED_LANGUAGES,
+    SUPPORTED_PROMPT_STYLES,
+    SUPPORTED_VISUAL_MODES,
     format_config_error,
     format_config_report,
     load_env_file,
@@ -64,6 +69,40 @@ def parse_args(args=None):
         type=optional_non_negative_int,
         metavar="INDEX",
         help="PyAudio input-device index. Overrides AUDIO_INPUT_DEVICE_INDEX from .env."
+    )
+    startup_controls = parser.add_argument_group("startup controls")
+    startup_controls.add_argument(
+        "--gender",
+        choices=sorted(SUPPORTED_GENDERS),
+        help="Initial gender mode. Overrides DEFAULT_GENDER for this run.",
+    )
+    startup_controls.add_argument(
+        "--age",
+        choices=sorted(SUPPORTED_AGES),
+        help="Initial age mode. Overrides DEFAULT_AGE for this run.",
+    )
+    startup_controls.add_argument(
+        "--visual-mode",
+        choices=sorted(SUPPORTED_VISUAL_MODES),
+        help=(
+            "Initial visual identity mode. Overrides DEFAULT_VISUAL_MODE "
+            "for this run."
+        ),
+    )
+    startup_controls.add_argument(
+        "--prompt-style",
+        choices=sorted(SUPPORTED_PROMPT_STYLES),
+        help=(
+            "Initial prompt style. Overrides DEFAULT_PROMPT_STYLE for this run."
+        ),
+    )
+    startup_controls.add_argument(
+        "--language",
+        choices=sorted(SUPPORTED_LANGUAGES),
+        help=(
+            "Initial transcription language. Overrides DEFAULT_LANGUAGE "
+            "for this run."
+        ),
     )
     parser.add_argument(
         "--list-audio-devices",
@@ -108,6 +147,11 @@ def load_runtime_config(args=None):
     return RuntimeConfig.from_environment(
         backend_override=getattr(args, "backend", None),
         input_device_override=getattr(args, "input_device", None),
+        gender_override=getattr(args, "gender", None),
+        age_override=getattr(args, "age", None),
+        visual_mode_override=getattr(args, "visual_mode", None),
+        prompt_style_override=getattr(args, "prompt_style", None),
+        language_override=getattr(args, "language", None),
     )
 
 
@@ -129,11 +173,6 @@ AGE_MODES = {
     "adult": "adult",
     "elder": "elderly"
 }
-
-CURRENT_GENDER = "neutral"
-CURRENT_AGE = "adult"
-CURRENT_VISUAL_MODE = "asian_american"
-CURRENT_PROMPT_STYLE = "human_focus"
 
 VISUAL_MODES = {
     "asian_american": {
@@ -367,11 +406,15 @@ class RealTimePipeline:
         self.backend_status = "ready"
         self.last_inference_latency = 0.0
         self.last_total_latency = 0.0
-        self.current_gender = CURRENT_GENDER
-        self.current_age = CURRENT_AGE
-        self.current_visual_mode = CURRENT_VISUAL_MODE
-        self.current_prompt_style = CURRENT_PROMPT_STYLE
-        self.current_language = None  # Default to Auto
+        self.current_gender = self.config.default_gender
+        self.current_age = self.config.default_age
+        self.current_visual_mode = self.config.default_visual_mode
+        self.current_prompt_style = self.config.default_prompt_style
+        self.current_language = (
+            None
+            if self.config.default_language == "auto"
+            else self.config.default_language
+        )
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.scene_lock = threading.Lock()
@@ -381,6 +424,11 @@ class RealTimePipeline:
                 "event": "session_start",
                 "backend": self.backend,
                 "audio_source": self.audio_source.kind,
+                "gender": self.current_gender,
+                "age": self.current_age,
+                "visual_mode": self.current_visual_mode,
+                "prompt_style": self.current_prompt_style,
+                "language": self.current_language or "auto",
                 "log_file": (
                     str(self.log_session.path)
                     if self.log_session.path is not None
@@ -1108,7 +1156,7 @@ class RealTimePipeline:
             current_gender = self.current_gender
             current_age = self.current_age
 
-        visual_mode = VISUAL_MODES.get(current_visual_mode, VISUAL_MODES[CURRENT_VISUAL_MODE])
+        visual_mode = VISUAL_MODES[current_visual_mode]
 
         if current_prompt_style == "general_scene":
             variants = [
@@ -1308,11 +1356,11 @@ class RealTimePipeline:
             return
 
         valid_values = {
-            "gender": GENDER_MODES,
-            "age": AGE_MODES,
-            "visual_mode": VISUAL_MODES,
-            "prompt_style": PROMPT_STYLES,
-            "language": {None: None, "en": "ENGLISH", "zh": "CHINESE", "es": "SPANISH"},
+            "gender": SUPPORTED_GENDERS,
+            "age": SUPPORTED_AGES,
+            "visual_mode": SUPPORTED_VISUAL_MODES,
+            "prompt_style": SUPPORTED_PROMPT_STYLES,
+            "language": {None} | (SUPPORTED_LANGUAGES - {"auto"}),
         }
         if control_name not in valid_values or value not in valid_values[control_name]:
             raise ValueError(f"Invalid {control_name} control value: {value}")
@@ -1332,7 +1380,7 @@ class RealTimePipeline:
                 label = PROMPT_STYLES[value]["label"]
             else:
                 self.current_language = value
-                label = "AUTO-DETECT" if value is None else valid_values["language"][value]
+                label = "AUTO-DETECT" if value is None else value.upper()
 
         self.control_logger.info(
             "Runtime control changed",
@@ -1363,6 +1411,12 @@ class RealTimePipeline:
             print(
                 f"AUDIO SOURCE: {self.audio_source.name} "
                 f"({self.audio_source.kind})"
+            )
+            print(
+                "STARTUP CONTROLS: "
+                f"{self.current_gender}, {self.current_age}, "
+                f"{self.current_visual_mode}, {self.current_prompt_style}, "
+                f"{self.current_language or 'auto'}"
             )
             print("CONTROL KEYS:")
             print("  [GENDER] 'm' -> Man | 'w' -> Woman | 'n' -> Neutral")

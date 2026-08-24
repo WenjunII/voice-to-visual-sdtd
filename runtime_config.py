@@ -7,6 +7,15 @@ from urllib.parse import urlparse
 
 
 SUPPORTED_BACKENDS = {"whisper", "faster_whisper", "groq", "groq_hybrid", "google"}
+SUPPORTED_GENDERS = {"man", "neutral", "woman"}
+SUPPORTED_AGES = {"adult", "elder", "young"}
+SUPPORTED_VISUAL_MODES = {
+    "asian_american",
+    "asian_black_brown",
+    "black_brown",
+}
+SUPPORTED_PROMPT_STYLES = {"general_scene", "human_focus"}
+SUPPORTED_LANGUAGES = {"auto", "en", "es", "zh"}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 NORMALIZED_ENV_NAMES = {
@@ -21,6 +30,11 @@ NORMALIZED_ENV_NAMES = {
     "HYBRID_TRANSLATION_FALLBACK",
     "VAD_ENGINE",
     "RUNTIME_LOG_LEVEL",
+    "DEFAULT_GENDER",
+    "DEFAULT_AGE",
+    "DEFAULT_VISUAL_MODE",
+    "DEFAULT_PROMPT_STYLE",
+    "DEFAULT_LANGUAGE",
 }
 
 
@@ -155,6 +169,16 @@ class RuntimeConfig:
             "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
         ),
     )
+
+    default_gender: str = _config_field("DEFAULT_GENDER", "neutral")
+    default_age: str = _config_field("DEFAULT_AGE", "adult")
+    default_visual_mode: str = _config_field(
+        "DEFAULT_VISUAL_MODE", "asian_american"
+    )
+    default_prompt_style: str = _config_field(
+        "DEFAULT_PROMPT_STYLE", "human_focus"
+    )
+    default_language: str = _config_field("DEFAULT_LANGUAGE", "auto")
 
     osc_ip: str = _config_field("OSC_IP", "127.0.0.1")
     osc_port: int = _config_field("OSC_PORT", 7000)
@@ -315,6 +339,11 @@ class RuntimeConfig:
         *,
         backend_override=None,
         input_device_override=None,
+        gender_override=None,
+        age_override=None,
+        visual_mode_override=None,
+        prompt_style_override=None,
+        language_override=None,
     ):
         source = dict(os.environ if values is None else values)
         legacy_interval = source.get("ONLINE_TRANSCRIPTION_INTERVAL")
@@ -329,6 +358,15 @@ class RuntimeConfig:
             source["TRANSCRIPTION_BACKEND"] = backend_override
         if input_device_override is not None:
             source["AUDIO_INPUT_DEVICE_INDEX"] = input_device_override
+        for name, value in {
+            "DEFAULT_GENDER": gender_override,
+            "DEFAULT_AGE": age_override,
+            "DEFAULT_VISUAL_MODE": visual_mode_override,
+            "DEFAULT_PROMPT_STYLE": prompt_style_override,
+            "DEFAULT_LANGUAGE": language_override,
+        }.items():
+            if value is not None:
+                source[name] = value
 
         reader = _EnvironmentReader(source)
         defaults = cls()
@@ -368,6 +406,37 @@ class RuntimeConfig:
             )
         if not self.faster_whisper_compute_type:
             errors.append("FASTER_WHISPER_COMPUTE_TYPE must not be empty")
+
+        self._validate_choice(
+            errors,
+            "DEFAULT_GENDER",
+            self.default_gender,
+            SUPPORTED_GENDERS,
+        )
+        self._validate_choice(
+            errors,
+            "DEFAULT_AGE",
+            self.default_age,
+            SUPPORTED_AGES,
+        )
+        self._validate_choice(
+            errors,
+            "DEFAULT_VISUAL_MODE",
+            self.default_visual_mode,
+            SUPPORTED_VISUAL_MODES,
+        )
+        self._validate_choice(
+            errors,
+            "DEFAULT_PROMPT_STYLE",
+            self.default_prompt_style,
+            SUPPORTED_PROMPT_STYLES,
+        )
+        self._validate_choice(
+            errors,
+            "DEFAULT_LANGUAGE",
+            self.default_language,
+            SUPPORTED_LANGUAGES,
+        )
 
         self._require_positive(
             errors,
@@ -586,6 +655,13 @@ class RuntimeConfig:
     def _validate_port(errors, name, value):
         if not 1 <= value <= 65535:
             errors.append(f"{name} must be between 1 and 65535")
+
+    @staticmethod
+    def _validate_choice(errors, name, value, choices):
+        if value not in choices:
+            errors.append(
+                f"{name} must be one of: " + ", ".join(sorted(choices))
+            )
 
     @staticmethod
     def _validate_order(errors, min_name, minimum, max_name, maximum):

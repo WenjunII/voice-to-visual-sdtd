@@ -15,7 +15,7 @@ from audio_sources import WavReplaySource
 from backend_errors import RetryableTranscriptionError
 from osc_output import RecordingOutputPublisher
 from runtime_config import RuntimeConfig
-from transcriber import RealTimePipeline, main, parse_args
+from transcriber import RealTimePipeline, load_runtime_config, main, parse_args
 
 
 def make_backend_adapter(*, online=False):
@@ -78,10 +78,71 @@ class CommandLineTests(unittest.TestCase):
 
         self.assertEqual(args.input_device, 4)
 
+    def test_accepts_startup_control_overrides(self):
+        args = parse_args(
+            [
+                "--gender",
+                "woman",
+                "--age",
+                "elder",
+                "--visual-mode",
+                "black_brown",
+                "--prompt-style",
+                "general_scene",
+                "--language",
+                "zh",
+            ]
+        )
+
+        self.assertEqual(args.gender, "woman")
+        self.assertEqual(args.age, "elder")
+        self.assertEqual(args.visual_mode, "black_brown")
+        self.assertEqual(args.prompt_style, "general_scene")
+        self.assertEqual(args.language, "zh")
+
+    def test_passes_startup_control_overrides_to_runtime_configuration(self):
+        args = parse_args(
+            [
+                "--gender",
+                "woman",
+                "--age",
+                "elder",
+                "--visual-mode",
+                "black_brown",
+                "--prompt-style",
+                "general_scene",
+                "--language",
+                "es",
+            ]
+        )
+        with (
+            patch("transcriber.load_env_file"),
+            patch(
+                "transcriber.RuntimeConfig.from_environment",
+                return_value=RuntimeConfig(),
+            ) as config_loader,
+        ):
+            load_runtime_config(args)
+
+        config_loader.assert_called_once_with(
+            backend_override=None,
+            input_device_override=None,
+            gender_override="woman",
+            age_override="elder",
+            visual_mode_override="black_brown",
+            prompt_style_override="general_scene",
+            language_override="es",
+        )
+
     def test_rejects_a_negative_audio_input_device(self):
         with redirect_stderr(StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--input-device", "-1"])
+
+    def test_rejects_an_invalid_startup_control_override(self):
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--visual-mode", "unknown"])
 
     def test_accepts_a_wav_replay_path(self):
         args = parse_args(["--replay", "session.wav"])
@@ -404,6 +465,11 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             vad_pre_roll_seconds=0.1,
             vad_silence_seconds=0.25,
             stream_overlap_seconds=0.2,
+            default_gender="woman",
+            default_age="elder",
+            default_visual_mode="black_brown",
+            default_prompt_style="general_scene",
+            default_language="zh",
         )
         second_config = replace(
             RuntimeConfig(),
@@ -416,6 +482,11 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             vad_pre_roll_seconds=0.6,
             vad_silence_seconds=1.1,
             stream_overlap_seconds=0.8,
+            default_gender="man",
+            default_age="young",
+            default_visual_mode="asian_black_brown",
+            default_prompt_style="human_focus",
+            default_language="es",
         )
 
         first = make_pipeline(first_config)
@@ -435,6 +506,27 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
         self.assertEqual(second.segmenter.end_silence_samples, 17600)
         self.assertEqual(first.segmenter.overlap_chunks, 4)
         self.assertEqual(second.segmenter.overlap_chunks, 13)
+        self.assertEqual(first.current_gender, "woman")
+        self.assertEqual(second.current_gender, "man")
+        self.assertEqual(first.current_age, "elder")
+        self.assertEqual(second.current_age, "young")
+        self.assertEqual(first.current_visual_mode, "black_brown")
+        self.assertEqual(
+            second.current_visual_mode,
+            "asian_black_brown",
+        )
+        self.assertEqual(first.current_prompt_style, "general_scene")
+        self.assertEqual(second.current_prompt_style, "human_focus")
+        self.assertEqual(first.current_language, "zh")
+        self.assertEqual(second.current_language, "es")
+        self.assertIn(
+            "no central human figure",
+            first.build_visual_prompt("a city after rain"),
+        )
+        self.assertIn(
+            "young Asian, Black, or Brown man",
+            second.build_visual_prompt("a city after rain"),
+        )
 
     def test_each_pipeline_uses_its_own_osc_configuration(self):
         first_config = replace(
