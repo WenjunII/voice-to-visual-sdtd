@@ -6,13 +6,14 @@ import numpy as np
 import requests
 
 from backend_errors import RetryableTranscriptionError, retry_after_seconds
+from dependency_profiles import install_command_for_backend
 
 
 BACKEND_REQUIRED_MODULES = {
     "whisper": {"torch", "whisper"},
     "faster_whisper": {"torch", "faster_whisper", "ctranslate2"},
     "groq": set(),
-    "groq_hybrid": {"argostranslate"},
+    "groq_hybrid": {"argostranslate", "langdetect"},
     "google": {"speech_recognition"},
 }
 
@@ -441,7 +442,7 @@ class LocalTextTranslator:
             except ImportError:
                 self.logger(
                     "[LOCAL TRANSLATOR]: Argos Translate is not installed. "
-                    "Run: pip install argostranslate langdetect"
+                    f"Run: {install_command_for_backend('groq_hybrid')}"
                 )
                 return
             except Exception as exc:
@@ -659,7 +660,7 @@ def create_transcription_backend(
         except Exception as exc:
             raise RuntimeError(
                 f"TRANSCRIPTION_BACKEND={name} requires torch. "
-                "Run: pip install -r requirements.txt"
+                f"Run: {install_command_for_backend(name)}"
             ) from exc
 
         device = config.whisper_device
@@ -678,7 +679,7 @@ def create_transcription_backend(
             except ImportError as exc:
                 raise RuntimeError(
                     "TRANSCRIPTION_BACKEND=whisper requires openai-whisper. "
-                    "Run: pip install -r requirements.txt"
+                    f"Run: {install_command_for_backend(name)}"
                 ) from exc
             logger(
                 f"Loading Whisper model '{config.whisper_model_size}' "
@@ -701,7 +702,8 @@ def create_transcription_backend(
         except ImportError as exc:
             raise RuntimeError(
                 "TRANSCRIPTION_BACKEND=faster_whisper requires "
-                "faster-whisper. Run: pip install -r requirements.txt"
+                "faster-whisper. "
+                f"Run: {install_command_for_backend(name)}"
             ) from exc
         logger(
             f"Loading faster-whisper model '{config.whisper_model_size}' "
@@ -779,7 +781,8 @@ def create_transcription_backend(
     except ImportError as exc:
         raise RuntimeError(
             "TRANSCRIPTION_BACKEND=google requires the SpeechRecognition "
-            "package. Run: pip install SpeechRecognition"
+            "package. "
+            f"Run: {install_command_for_backend(name)}"
         ) from exc
     logger(
         "Using online Google Speech Recognition backend. "

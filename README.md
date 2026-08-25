@@ -21,6 +21,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
+- **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
 - **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
 - **Resilient OSC Output**: Isolates UDP delivery failures from audio and transcription, rate-limits outage logs, reports recovery, and exposes an in-memory publisher for deterministic protocol and replay tests.
@@ -88,10 +89,31 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     cd voice-to-visual-sdtd
     ```
 
-2.  **Install dependencies**:
+2.  **Install the dependency profile for your transcription backend**:
+
+    The existing command remains the recommended local NVIDIA setup and now delegates to the faster-whisper profile:
+
     ```bash
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
     ```
+
+    Choose another profile when the project uses a different backend:
+
+    | Backend | Install command | Notes |
+    | :--- | :--- | :--- |
+    | `faster_whisper` | `python -m pip install -r requirements/faster-whisper.txt` | Recommended local NVIDIA backend; pins the current CUDA 12/cuDNN 8 CTranslate2 setup |
+    | `whisper` | `python -m pip install -r requirements/whisper.txt` | Original OpenAI Whisper local NVIDIA backend |
+    | `groq` | `python -m pip install -r requirements/groq.txt` | Lightweight hosted translation; no local CUDA transcription runtime |
+    | `groq_hybrid` | `python -m pip install -r requirements/groq-hybrid.txt` | Hosted transcription plus local Argos translation |
+    | `google` | `python -m pip install -r requirements/google.txt` | Experimental recognition-only backend |
+
+    Every backend profile includes `requirements/core.txt`, which contains the microphone, OSC, HTTP, prompt-tokenizer, and numerical packages shared by the bridge. The online profiles use the built-in energy VAD unless Silero is already installed. To add Silero CPU VAD to an online environment:
+
+    ```powershell
+    python -m pip install -r requirements/vad-silero.txt
+    ```
+
+    StreamDiffusion, CuPy, SpoutGL, torchvision, and torchaudio are not imported by this Python OSC bridge and are no longer installed for every transcription backend. Prefer StreamDiffusionTD's own environment instructions. If those visual components intentionally share this Python environment, their former package set is preserved separately in `requirements/streamdiffusion.txt`.
 
 3.  **Environment Setup**:
     Copy the example environment file and keep real credentials in your local `.env` only:
@@ -268,7 +290,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     ```powershell
     python transcriber.py --diagnose
     ```
-    Diagnostics start from the same validated configuration and report only whether credentials are configured; they never print credential values.
+    Diagnostics start from the same validated configuration, display the exact dependency-profile install command, and report only whether credentials are configured; they never print credential values.
 3.  **Open TouchDesigner**: Load your StreamDiffusionTD project and ensure the OSC In DAT is listening on **Port 7000**.
 4.  **Choose a microphone when needed**: The system default is used automatically. On a multi-device installation, list available inputs and select one for the current run:
     ```powershell
@@ -295,7 +317,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     `faster_whisper` uses CTranslate2 on the CUDA GPU and is the recommended local mode when StreamDiffusion shares the same GPU. `whisper` preserves the original OpenAI Whisper CUDA implementation. Both auto-detect multilingual audio and use Whisper's `translate` task to produce English. `groq` uses online multilingual translation and does not load local Whisper. `groq_hybrid` uses Groq turbo for online transcription, then translates non-English text locally on CPU with Argos Translate when available. If local translation is unavailable or still returns Chinese/Cantonese text, `HYBRID_TRANSLATION_FALLBACK=groq_text` sends only the transcript text through a fast Groq chat model for English cleanup.
 
-    The dependency file pins CTranslate2 `4.4.0` for this project's current Windows CUDA 12 + cuDNN 8 setup. Silero VAD runs on the CPU. If Silero cannot load, the script reports the problem and automatically uses the energy detector.
+    The faster-whisper dependency profile pins CTranslate2 `4.4.0` for this project's current Windows CUDA 12 + cuDNN 8 setup. Silero VAD runs on the CPU. If Silero cannot load, the script reports the problem and automatically uses the energy detector.
 
     The first `faster_whisper` run downloads and caches its converted Whisper model. Prompt budgeting also caches two small tokenizer configurations. Later launches reuse both local caches.
 
@@ -394,6 +416,8 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 - `transcriber.py` coordinates live audio, scheduling, prompt generation, controls, cooperative worker cancellation, and ordered process cleanup. It loads `.env` only when constructing a default pipeline or entering the CLI, so importing the module does not parse, validate, or cache project runtime settings.
 - `audio_sources.py` owns lazy PyAudio setup, microphone streams, WAV decoding/resampling, deterministic chunking, replay pacing, and source cleanup.
 - `transcription_backends.py` owns lazy model/API setup, backend-specific transcription and translation contracts, audio timing limits, and resource cleanup.
+- `dependency_profiles.py` maps each transcription backend to its requirements file and actionable installation command.
+- `requirements/` separates shared bridge packages, backend extras, optional Silero VAD, and the external visual-runtime package set.
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
 - `audio_runtime.py` owns CPU voice activity detectors.
@@ -423,7 +447,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also verifies configuration and startup-profile isolation, command-line precedence, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile and missing microphone dependency instead of failing during import.
 
 ## License
 

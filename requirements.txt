@@ -1,21 +1,3 @@
-# Core Requirements
-requests
-numpy<1.25.0
-PyAudio
-openai-whisper
-faster-whisper==1.2.1
-# Current Windows setup uses CUDA 12 with cuDNN 8.
-ctranslate2==4.4.0
-silero-vad==6.2.1
-transformers>=4.37,<6
-SpeechRecognition
-argostranslate
-langdetect
-streamdiffusion
-torch
-torchvision
-torchaudio
-pythonosc
-google-generativeai
-cupy-cuda12x
-SpoutGL
+# Recommended local NVIDIA transcription profile.
+# Choose a different requirements/<backend>.txt file when using another backend.
+-r requirements/faster-whisper.txt

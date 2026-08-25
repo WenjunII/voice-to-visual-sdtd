@@ -486,6 +486,31 @@ class BackendFactoryTests(unittest.TestCase):
             device="cuda",
         )
 
+    def test_missing_backend_packages_name_the_matching_profile(self):
+        torch_module = self.torch_module()
+        cases = (
+            ("whisper", {"torch": torch_module, "whisper": None}),
+            (
+                "faster_whisper",
+                {"torch": torch_module, "faster_whisper": None},
+            ),
+            ("google", {"speech_recognition": None}),
+        )
+
+        for backend, modules in cases:
+            with self.subTest(backend=backend):
+                profile = backend.replace("_", "-")
+                with patch.dict(sys.modules, modules):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        rf"requirements/{profile}\.txt",
+                    ):
+                        create_transcription_backend(
+                            config_for(backend),
+                            sample_rate=16000,
+                            logger=Mock(),
+                        )
+
     def test_wraps_faster_whisper_cuda_initialization_failures(self):
         torch_module = self.torch_module()
         faster_module = types.ModuleType("faster_whisper")
@@ -526,6 +551,10 @@ class BackendFactoryTests(unittest.TestCase):
             {"torch", "faster_whisper", "ctranslate2"},
         )
         self.assertEqual(required_modules_for_backend("groq"), set())
+        self.assertEqual(
+            required_modules_for_backend("groq_hybrid"),
+            {"argostranslate", "langdetect"},
+        )
 
 
 class LanguageHelperTests(unittest.TestCase):

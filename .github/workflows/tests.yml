@@ -39,7 +39,8 @@ jobs:
       - name: Compile project modules
         run: >-
           python -m py_compile
-          audio_runtime.py audio_sources.py backend_errors.py diagnostics.py orchestrator.py
+          audio_runtime.py audio_sources.py backend_errors.py dependency_profiles.py
+          diagnostics.py orchestrator.py
           osc_control.py osc_output.py prompt_engine.py runtime_config.py runtime_scheduler.py
           runtime_logging.py
           streaming_core.py transcript_filter.py transcriber.py

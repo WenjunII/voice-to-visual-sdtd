@@ -1,0 +1,5 @@
+# Original OpenAI Whisper local NVIDIA backend.
+-r core.txt
+openai-whisper
+torch
+silero-vad==6.2.1
