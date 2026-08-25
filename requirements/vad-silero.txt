@@ -1,0 +1,3 @@
+# Optional CPU VAD for online backends. Energy VAD is the built-in fallback.
+torch
+silero-vad==6.2.1

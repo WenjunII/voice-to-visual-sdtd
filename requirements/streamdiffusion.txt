@@ -1,0 +1,8 @@
+# Optional visual-runtime dependencies, not imported by the Python OSC bridge.
+# Prefer StreamDiffusionTD's own environment/setup instructions when possible.
+streamdiffusion
+torch
+torchvision
+torchaudio
+cupy-cuda12x
+SpoutGL

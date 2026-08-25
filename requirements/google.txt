@@ -1,0 +1,3 @@
+# Experimental Google Speech Recognition backend.
+-r core.txt
+SpeechRecognition

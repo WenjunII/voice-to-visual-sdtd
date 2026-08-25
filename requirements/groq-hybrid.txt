@@ -1,0 +1,4 @@
+# Hosted Groq transcription with local CPU translation.
+-r groq.txt
+argostranslate
+langdetect

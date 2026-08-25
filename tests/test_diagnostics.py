@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from diagnostics import _cuda_results, _microphone_result
+from diagnostics import _cuda_results, _microphone_result, _package_results
 
 
 class CudaDiagnosticTests(unittest.TestCase):
@@ -36,6 +36,23 @@ class CudaDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(results[0].status, "FAIL")
 
+    def test_missing_torch_names_the_local_backend_profile(self):
+        command = (
+            "python -m pip install -r requirements/faster-whisper.txt"
+        )
+        with patch(
+            "diagnostics.importlib.util.find_spec",
+            return_value=None,
+        ):
+            results = _cuda_results(
+                "cuda",
+                required=True,
+                install_command=command,
+            )
+
+        self.assertEqual(results[0].status, "FAIL")
+        self.assertIn(command, results[0].detail)
+
 
 class MicrophoneDiagnosticTests(unittest.TestCase):
     def test_checks_the_configured_input_device(self):
@@ -59,6 +76,31 @@ class MicrophoneDiagnosticTests(unittest.TestCase):
         self.assertEqual(audio_interface.open.call_args.kwargs["input_device_index"], 7)
         stream.close.assert_called_once()
         audio_interface.terminate.assert_called_once()
+
+
+class PackageDiagnosticTests(unittest.TestCase):
+    def test_missing_required_package_names_the_backend_profile(self):
+        with patch(
+            "diagnostics.importlib.util.find_spec",
+            return_value=None,
+        ):
+            results = _package_results("google")
+
+        speech_recognition = next(
+            result
+            for result in results
+            if result.name == "SpeechRecognition"
+        )
+        self.assertEqual(speech_recognition.status, "FAIL")
+        self.assertIn(
+            "python -m pip install -r requirements/google.txt",
+            speech_recognition.detail,
+        )
+        argos = next(
+            result for result in results if result.name == "Argos Translate"
+        )
+        self.assertEqual(argos.status, "INFO")
+        self.assertEqual(argos.detail, "not installed (optional)")
 
 
 if __name__ == "__main__":

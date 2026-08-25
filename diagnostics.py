@@ -8,6 +8,7 @@ from importlib import metadata
 from pathlib import Path
 
 from audio_runtime import get_audio_input_device
+from dependency_profiles import install_command_for_backend
 from transcription_backends import required_modules_for_backend
 
 
@@ -25,13 +26,18 @@ def run_diagnostics(
     device=None,
 ):
     backend = config.transcription_backend
+    install_command = install_command_for_backend(backend)
     effective_device = device or config.whisper_device
-    results = [DiagnosticResult("Configuration", "PASS", "validated")]
+    results = [
+        DiagnosticResult("Configuration", "PASS", "validated"),
+        DiagnosticResult("Dependency profile", "INFO", install_command),
+    ]
     results.append(_python_result())
     results.extend(
         _cuda_results(
             effective_device,
             required=backend in {"whisper", "faster_whisper"},
+            install_command=install_command,
         )
     )
     results.extend(_package_results(backend))
@@ -81,10 +87,13 @@ def _python_result():
     return DiagnosticResult("Python", status, version)
 
 
-def _cuda_results(device, required):
+def _cuda_results(device, required, install_command=None):
     if importlib.util.find_spec("torch") is None:
         status = "FAIL" if required else "INFO"
-        return [DiagnosticResult("PyTorch", status, "not installed")]
+        detail = "not installed"
+        if required and install_command:
+            detail += f"; run {install_command}"
+        return [DiagnosticResult("PyTorch", status, detail)]
     if not required:
         try:
             version = metadata.version("torch")
@@ -127,6 +136,7 @@ def _cuda_results(device, required):
 
 def _package_results(backend):
     required_modules = required_modules_for_backend(backend)
+    install_command = install_command_for_backend(backend)
     packages = {
         "python-osc": ("pythonosc", True),
         "PyAudio": ("pyaudio", True),
@@ -146,12 +156,19 @@ def _package_results(backend):
             "argostranslate",
             "argostranslate" in required_modules,
         ),
+        "LangDetect": ("langdetect", "langdetect" in required_modules),
     }
     results = []
     for label, (module, required) in packages.items():
         installed = importlib.util.find_spec(module) is not None
         status = "PASS" if installed else ("FAIL" if required else "INFO")
-        results.append(DiagnosticResult(label, status, "installed" if installed else "not installed"))
+        if installed:
+            detail = "installed"
+        elif required:
+            detail = f"not installed; run {install_command}"
+        else:
+            detail = "not installed (optional)"
+        results.append(DiagnosticResult(label, status, detail))
     return results
 
 

@@ -1,0 +1,7 @@
+# Recommended local NVIDIA backend.
+-r core.txt
+faster-whisper==1.2.1
+# Current Windows setup uses CUDA 12 with cuDNN 8.
+ctranslate2==4.4.0
+torch
+silero-vad==6.2.1

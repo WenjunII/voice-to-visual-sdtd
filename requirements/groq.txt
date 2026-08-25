@@ -1,0 +1,3 @@
+# Hosted Groq Whisper translation without a local CUDA runtime.
+# Silero VAD is optional; the runtime falls back to energy detection.
+-r core.txt
