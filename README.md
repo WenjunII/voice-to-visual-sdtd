@@ -34,7 +34,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 ## Tech Stack
 
 - **Transcription**: `faster-whisper` (recommended Small model on CUDA), `openai-whisper` (preserved local backend), Groq `whisper-large-v3` translation, Groq `whisper-large-v3-turbo` transcription with local Argos Translate, or `SpeechRecognition` with Google Speech Recognition (recognition-only experiment)
-- **Optional LLM Orchestration**: `orchestrator.py` can refine a single prompt through its configured Ollama model sequence. The live `transcriber.py` path uses the fixed prompt templates directly.
+- **Optional LLM Prompt Refinement**: The standalone `orchestrator.py` command validates an ordered Ollama/Capriole fallback chain, bounds HTTP calls, validates responses, and sends the first usable prompt over resilient OSC. The latency-sensitive `transcriber.py` path continues to use fixed prompt templates and does not call an LLM.
 - **Visual Engine**: StreamDiffusion (SDXL-Turbo/Lightning)
 - **Bridge**: TouchDesigner via OSC output on port 7000 and control input on port 7001
 - **Language**: Python 3.10+
@@ -132,19 +132,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     The command checks types, supported choices, ports, positive ranges, and related minimum/maximum settings. It prints the effective configuration while replacing configured API keys with `<redacted>`. Invalid settings return exit code `2` with all detected problems in one report.
 
-    Set your Capriole API key (if using cloud models). You can do this in two ways:
-
-    *   **Option A: Use a `.env` file (Recommended)**
-        Create a `.env` file in the root directory of the project (which is automatically ignored by Git to keep your key secure):
-        ```env
-        CAPRIOLE_API_KEY="your_key_here"
-        ```
-
-    *   **Option B: Set Environment Variable**
-        Or, set it directly in your terminal environment:
-        ```powershell
-        $env:CAPRIOLE_API_KEY = "your_key_here"
-        ```
+    `CAPRIOLE_API_KEY` is optional. It is required only when the standalone prompt-refinement chain contains a `capriole:` route. Keep it in `.env` or the process environment; never add a real key to `.env.example`.
 
     Optional live transcription settings:
 
@@ -231,6 +219,16 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     PROMPT_MIN_TRANSCRIPT_TOKENS=20
     PROMPT_LOG_TOKENS=true
     PROMPT_TOKENIZER_MODELS=openai/clip-vit-large-patch14,laion/CLIP-ViT-bigG-14-laion2B-39B-b160k
+
+    # Standalone orchestrator.py only. Routes are attempted from left to right.
+    PROMPT_REFINEMENT_CHAIN=ollama:gemini-3-flash-preview,ollama:kimi-k2.6:cloud,ollama:gemma4:31b-cloud
+    PROMPT_REFINEMENT_OLLAMA_ENDPOINT=http://localhost:11434/api/generate
+    PROMPT_REFINEMENT_CAPRIOLE_ENDPOINT=https://api.caprioletech.com/v1/chat
+    PROMPT_REFINEMENT_REQUEST_TIMEOUT=15.0
+    PROMPT_REFINEMENT_TARGET_TOKENS=70
+    PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS=1000
+    # Required only if a route starts with capriole:.
+    # CAPRIOLE_API_KEY="your_capriole_key_here"
 
     # Recommended online option for StreamDiffusion: multilingual audio -> English prompt text.
     # Uses Groq's hosted Whisper translation endpoint. The free plan has rate limits.
@@ -327,6 +325,26 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     python transcriber.py
     ```
 6.  **Speak & Control**: The system will automatically capture your speech. Use the keys above or the OSC controls below to change the visuals as you talk.
+
+### Optional LLM Prompt Refinement
+
+LLM refinement is a separate, one-prompt command. It is not part of the microphone loop, so an unavailable model or slow network cannot add latency to `transcriber.py`:
+
+```powershell
+python orchestrator.py "a futuristic space station orbiting a dying star"
+python orchestrator.py "continue toward the red nebula" --context "wide orbital view"
+python orchestrator.py "preview this prompt only" --no-osc
+```
+
+`PROMPT_REFINEMENT_CHAIN` is a comma-separated, ordered list of `provider:model` routes. Model names may contain additional colons. The default configuration tries these Ollama identifiers in order:
+
+1. `gemini-3-flash-preview`
+2. `kimi-k2.6:cloud`
+3. `gemma4:31b-cloud`
+
+These are configured model identifiers, not bundled models. They must already be available through the Ollama endpoint. Replace the chain with models installed or exposed by your Ollama setup. To use Capriole, add a route such as `capriole:your-model-id` and configure `CAPRIOLE_API_KEY`.
+
+Each provider call uses `PROMPT_REFINEMENT_REQUEST_TIMEOUT`. Empty, malformed, non-text, or oversized responses advance to the next route. If all routes fail, the command emits a deterministic prompt based on the input. Operational logs record provider, model, attempt, latency, and output length without recording the supplied prompt or scene context. `PROMPT_REFINEMENT_TARGET_TOKENS` is an instruction to the model; `PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS` is the enforced response safety limit.
 
 ### Deterministic WAV Replay
 

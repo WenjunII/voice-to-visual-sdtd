@@ -186,6 +186,9 @@ class RuntimeLogSession:
                     f"{config.runtime_log_file}: {exc}"
                 ) from exc
 
+        if not self._handlers:
+            self._add_handler(logging.NullHandler())
+
     def logger(self, subsystem):
         return self._base_logger.getChild(str(subsystem).strip() or "runtime")
 
