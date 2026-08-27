@@ -16,6 +16,7 @@ SUPPORTED_VISUAL_MODES = {
 }
 SUPPORTED_PROMPT_STYLES = {"general_scene", "human_focus"}
 SUPPORTED_LANGUAGES = {"auto", "en", "es", "zh"}
+SUPPORTED_PROMPT_REFINEMENT_PROVIDERS = {"capriole", "ollama"}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 NORMALIZED_ENV_NAMES = {
@@ -168,6 +169,31 @@ class RuntimeConfig:
             "openai/clip-vit-large-patch14",
             "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
         ),
+    )
+    prompt_refinement_chain: tuple = _config_field(
+        "PROMPT_REFINEMENT_CHAIN",
+        (
+            "ollama:gemini-3-flash-preview",
+            "ollama:kimi-k2.6:cloud",
+            "ollama:gemma4:31b-cloud",
+        ),
+    )
+    prompt_refinement_ollama_endpoint: str = _config_field(
+        "PROMPT_REFINEMENT_OLLAMA_ENDPOINT",
+        "http://localhost:11434/api/generate",
+    )
+    prompt_refinement_capriole_endpoint: str = _config_field(
+        "PROMPT_REFINEMENT_CAPRIOLE_ENDPOINT",
+        "https://api.caprioletech.com/v1/chat",
+    )
+    prompt_refinement_request_timeout: float = _config_field(
+        "PROMPT_REFINEMENT_REQUEST_TIMEOUT", 15.0
+    )
+    prompt_refinement_target_tokens: int = _config_field(
+        "PROMPT_REFINEMENT_TARGET_TOKENS", 70
+    )
+    prompt_refinement_max_output_characters: int = _config_field(
+        "PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS", 1000
     )
 
     default_gender: str = _config_field("DEFAULT_GENDER", "neutral")
@@ -447,6 +473,15 @@ class RuntimeConfig:
                 "FASTER_WHISPER_CPU_THREADS": self.faster_whisper_cpu_threads,
                 "FASTER_WHISPER_NUM_WORKERS": self.faster_whisper_num_workers,
                 "PROMPT_MAX_TOKENS": self.prompt_max_tokens,
+                "PROMPT_REFINEMENT_REQUEST_TIMEOUT": (
+                    self.prompt_refinement_request_timeout
+                ),
+                "PROMPT_REFINEMENT_TARGET_TOKENS": (
+                    self.prompt_refinement_target_tokens
+                ),
+                "PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS": (
+                    self.prompt_refinement_max_output_characters
+                ),
                 "OSC_STATUS_INTERVAL": self.osc_status_interval,
                 "OSC_OUTPUT_ERROR_LOG_INTERVAL": (
                     self.osc_output_error_log_interval
@@ -525,6 +560,28 @@ class RuntimeConfig:
                 "PROMPT_TOKEN_BUDGET_ENABLED is true"
             )
 
+        refinement_providers = set()
+        if not self.prompt_refinement_chain:
+            errors.append(
+                "PROMPT_REFINEMENT_CHAIN must include at least one provider:model entry"
+            )
+        for route in self.prompt_refinement_chain:
+            provider, separator, model = route.partition(":")
+            provider = provider.strip().lower()
+            model = model.strip()
+            if not separator or not provider or not model:
+                errors.append(
+                    "PROMPT_REFINEMENT_CHAIN entries must use provider:model"
+                )
+                continue
+            if provider not in SUPPORTED_PROMPT_REFINEMENT_PROVIDERS:
+                errors.append(
+                    "PROMPT_REFINEMENT_CHAIN provider must be one of: "
+                    + ", ".join(sorted(SUPPORTED_PROMPT_REFINEMENT_PROVIDERS))
+                )
+                continue
+            refinement_providers.add(provider)
+
         self._validate_port(errors, "OSC_PORT", self.osc_port)
         self._validate_port(errors, "OSC_CONTROL_PORT", self.osc_control_port)
         self._validate_order(
@@ -582,6 +639,12 @@ class RuntimeConfig:
             "GROQ_TRANSCRIPTIONS_ENDPOINT": self.groq_transcriptions_endpoint,
             "GROQ_TRANSLATIONS_ENDPOINT": self.groq_translations_endpoint,
             "GROQ_CHAT_ENDPOINT": self.groq_chat_endpoint,
+            "PROMPT_REFINEMENT_OLLAMA_ENDPOINT": (
+                self.prompt_refinement_ollama_endpoint
+            ),
+            "PROMPT_REFINEMENT_CAPRIOLE_ENDPOINT": (
+                self.prompt_refinement_capriole_endpoint
+            ),
         }.items():
             parsed = urlparse(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -599,6 +662,13 @@ class RuntimeConfig:
         ):
             errors.append(
                 f"TRANSCRIPTION_BACKEND={self.transcription_backend} requires GROQ_API_KEY"
+            )
+        if (
+            "capriole" in refinement_providers
+            and not self.is_secret_configured(self.capriole_api_key)
+        ):
+            errors.append(
+                "PROMPT_REFINEMENT_CHAIN with capriole requires CAPRIOLE_API_KEY"
             )
         return errors
 

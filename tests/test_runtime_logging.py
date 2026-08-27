@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -12,6 +13,21 @@ from transcriber import RealTimePipeline
 
 
 class RuntimeLogSessionTests(unittest.TestCase):
+    def test_disabling_every_log_destination_is_silent(self):
+        stream = StringIO()
+        config = replace(
+            RuntimeConfig(),
+            runtime_log_console_enabled=False,
+            runtime_log_file="",
+        )
+        session = RuntimeLogSession(config, session_id="silent-test")
+
+        with redirect_stderr(stream):
+            session.logger("orchestrator").warning("must stay silent")
+        session.close()
+
+        self.assertEqual(stream.getvalue(), "")
+
     def test_console_logs_include_context_and_redact_credentials(self):
         stream = StringIO()
         config = replace(

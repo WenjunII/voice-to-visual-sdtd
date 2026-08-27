@@ -40,6 +40,17 @@ class RuntimeConfigTests(unittest.TestCase):
                 "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
             ),
         )
+        self.assertEqual(
+            config.prompt_refinement_chain,
+            (
+                "ollama:gemini-3-flash-preview",
+                "ollama:kimi-k2.6:cloud",
+                "ollama:gemma4:31b-cloud",
+            ),
+        )
+        self.assertEqual(config.prompt_refinement_request_timeout, 15.0)
+        self.assertEqual(config.prompt_refinement_target_tokens, 70)
+        self.assertEqual(config.prompt_refinement_max_output_characters, 1000)
 
     def test_every_setting_has_a_unique_environment_name(self):
         environment_names = [
@@ -210,6 +221,85 @@ class RuntimeConfigTests(unittest.TestCase):
                         {
                             "TRANSCRIPTION_BACKEND": "groq",
                             "GROQ_API_KEY": key,
+                        }
+                    )
+
+    def test_parses_a_configurable_prompt_refinement_chain(self):
+        config = RuntimeConfig.from_environment(
+            {
+                "PROMPT_REFINEMENT_CHAIN": (
+                    "OLLAMA:local-model,capriole:hosted:model"
+                ),
+                "CAPRIOLE_API_KEY": "capriole-secret",
+                "PROMPT_REFINEMENT_REQUEST_TIMEOUT": "6.5",
+                "PROMPT_REFINEMENT_TARGET_TOKENS": "64",
+                "PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS": "900",
+            }
+        )
+
+        self.assertEqual(
+            config.prompt_refinement_chain,
+            ("OLLAMA:local-model", "capriole:hosted:model"),
+        )
+        self.assertEqual(config.prompt_refinement_request_timeout, 6.5)
+        self.assertEqual(config.prompt_refinement_target_tokens, 64)
+        self.assertEqual(config.prompt_refinement_max_output_characters, 900)
+
+    def test_validates_prompt_refinement_routes_and_limits_together(self):
+        with self.assertRaises(ConfigError) as context:
+            RuntimeConfig.from_environment(
+                {
+                    "PROMPT_REFINEMENT_CHAIN": "missing-route,other:model",
+                    "PROMPT_REFINEMENT_OLLAMA_ENDPOINT": "localhost:11434",
+                    "PROMPT_REFINEMENT_CAPRIOLE_ENDPOINT": "ftp://example.test",
+                    "PROMPT_REFINEMENT_REQUEST_TIMEOUT": "0",
+                    "PROMPT_REFINEMENT_TARGET_TOKENS": "-1",
+                    "PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS": "0",
+                }
+            )
+
+        errors = context.exception.errors
+        self.assertIn(
+            "PROMPT_REFINEMENT_CHAIN entries must use provider:model",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_CHAIN provider must be one of: capriole, ollama",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_OLLAMA_ENDPOINT must be an absolute HTTP(S) URL",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_CAPRIOLE_ENDPOINT must be an absolute HTTP(S) URL",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_REQUEST_TIMEOUT must be greater than 0",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_TARGET_TOKENS must be greater than 0",
+            errors,
+        )
+        self.assertIn(
+            "PROMPT_REFINEMENT_MAX_OUTPUT_CHARACTERS must be greater than 0",
+            errors,
+        )
+
+    def test_capriole_refinement_route_requires_a_real_key(self):
+        for key in ("", "your_capriole_key_here"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "PROMPT_REFINEMENT_CHAIN with capriole requires "
+                    "CAPRIOLE_API_KEY",
+                ):
+                    RuntimeConfig.from_environment(
+                        {
+                            "PROMPT_REFINEMENT_CHAIN": "capriole:model",
+                            "CAPRIOLE_API_KEY": key,
                         }
                     )
 
