@@ -1,10 +1,17 @@
 import sys
 import types
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from diagnostics import _cuda_results, _microphone_result, _package_results
+from diagnostics import (
+    _cuda_results,
+    _microphone_result,
+    _package_results,
+    _prompt_budget_result,
+)
+from runtime_config import RuntimeConfig
 
 
 class CudaDiagnosticTests(unittest.TestCase):
@@ -101,6 +108,72 @@ class PackageDiagnosticTests(unittest.TestCase):
         )
         self.assertEqual(argos.status, "INFO")
         self.assertEqual(argos.detail, "not installed (optional)")
+
+
+class PromptBudgetDiagnosticTests(unittest.TestCase):
+    def test_reports_exact_budgeting_when_every_tokenizer_loads_locally(self):
+        loader = Mock()
+        config = replace(
+            RuntimeConfig(),
+            prompt_tokenizer_models=("tokenizer-a", "tokenizer-b"),
+        )
+
+        result = _prompt_budget_result(config, tokenizer_loader=loader)
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("exact budgeting ready", result.detail)
+        self.assertEqual(
+            [call.args for call in loader.call_args_list],
+            [("tokenizer-a",), ("tokenizer-b",)],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs == {"local_files_only": True}
+                for call in loader.call_args_list
+            )
+        )
+
+    def test_reports_conservative_fallback_when_cache_is_incomplete(self):
+        loader = Mock(side_effect=[Mock(), OSError("not cached")])
+        config = replace(
+            RuntimeConfig(),
+            prompt_tokenizer_models=("tokenizer-a", "tokenizer-b"),
+            prompt_token_budget_fallback="conservative",
+        )
+
+        result = _prompt_budget_result(config, tokenizer_loader=loader)
+
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("1/2 available locally", result.detail)
+        self.assertIn("conservative offline budgeting", result.detail)
+
+    def test_missing_cache_is_a_failure_when_fallback_is_off(self):
+        config = replace(
+            RuntimeConfig(),
+            prompt_tokenizer_models=("tokenizer-a",),
+            prompt_token_budget_fallback="off",
+        )
+
+        result = _prompt_budget_result(
+            config,
+            tokenizer_loader=Mock(side_effect=OSError("not cached")),
+        )
+
+        self.assertEqual(result.status, "FAIL")
+        self.assertIn("fallback is off", result.detail)
+
+    def test_disabled_budgeting_does_not_load_tokenizers(self):
+        loader = Mock()
+        config = replace(
+            RuntimeConfig(),
+            prompt_token_budget_enabled=False,
+        )
+
+        result = _prompt_budget_result(config, tokenizer_loader=loader)
+
+        self.assertEqual(result.status, "INFO")
+        self.assertEqual(result.detail, "budgeting disabled")
+        loader.assert_not_called()
 
 
 if __name__ == "__main__":

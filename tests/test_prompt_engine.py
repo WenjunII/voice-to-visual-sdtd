@@ -1,6 +1,10 @@
 import unittest
 
-from prompt_engine import PromptBudgeter, RollingSceneMemory
+from prompt_engine import (
+    ConservativeUtf8Tokenizer,
+    PromptBudgeter,
+    RollingSceneMemory,
+)
 
 
 class WhitespaceTokenizer:
@@ -77,6 +81,7 @@ class PromptBudgeterTests(unittest.TestCase):
         self.assertLessEqual(result.token_count, 10)
         self.assertTrue(result.text.endswith("newer golden autumn leaves cinematic"))
         self.assertTrue(result.transcript_trimmed)
+        self.assertEqual(result.budget_mode, "exact")
 
     def test_enforces_the_most_restrictive_tokenizer(self):
         budgeter = PromptBudgeter(
@@ -90,6 +95,47 @@ class PromptBudgeterTests(unittest.TestCase):
 
         self.assertLessEqual(result.token_count, 12)
         self.assertIn("five six", result.text)
+
+    def test_conservative_fallback_bounds_utf8_without_model_files(self):
+        budgeter = PromptBudgeter(
+            [ConservativeUtf8Tokenizer()],
+            max_tokens=40,
+            min_transcript_tokens=8,
+            mode="fallback",
+        )
+        variants = [
+            ("compact", lambda text: f"scene {text} cinematic"),
+        ]
+
+        result = budgeter.fit(
+            variants,
+            "旧场景变成霓虹森林!!! café",
+        )
+
+        self.assertEqual(result.budget_mode, "fallback")
+        self.assertLessEqual(result.token_count, 40)
+        self.assertEqual(
+            result.token_count,
+            len(result.text.encode("utf-8")) + 2,
+        )
+        self.assertTrue(result.text)
+
+    def test_conservative_tokenizer_round_trips_unicode(self):
+        tokenizer = ConservativeUtf8Tokenizer()
+        text = "画面 café — neon"
+
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+
+        self.assertEqual(tokenizer.decode(token_ids), text)
+        self.assertEqual(len(tokenizer.encode(text)), len(text.encode("utf-8")) + 2)
+
+    def test_rejects_unknown_budget_modes(self):
+        with self.assertRaisesRegex(ValueError, "exact or fallback"):
+            PromptBudgeter([WhitespaceTokenizer()], mode="approximate")
+
+    def test_budget_must_allow_clip_boundary_tokens(self):
+        with self.assertRaisesRegex(ValueError, "boundary tokens"):
+            PromptBudgeter([WhitespaceTokenizer()], max_tokens=1)
 
 
 if __name__ == "__main__":

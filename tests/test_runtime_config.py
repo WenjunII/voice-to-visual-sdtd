@@ -41,6 +41,10 @@ class RuntimeConfigTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            config.prompt_token_budget_fallback,
+            "conservative",
+        )
+        self.assertEqual(
             config.prompt_refinement_chain,
             (
                 "ollama:gemini-3-flash-preview",
@@ -105,6 +109,13 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.default_visual_mode, "black_brown")
         self.assertEqual(config.default_prompt_style, "general_scene")
         self.assertEqual(config.default_language, "es")
+
+    def test_normalizes_prompt_budget_fallback(self):
+        config = RuntimeConfig.from_environment(
+            {"PROMPT_TOKEN_BUDGET_FALLBACK": "OFF"}
+        )
+
+        self.assertEqual(config.prompt_token_budget_fallback, "off")
 
     def test_rejects_invalid_startup_controls_together(self):
         with self.assertRaises(ConfigError) as context:
@@ -173,6 +184,8 @@ class RuntimeConfigTests(unittest.TestCase):
                     "RUNTIME_LOG_BACKUP_COUNT": "-1",
                     "RUNTIME_SHUTDOWN_GRACE_SECONDS": "0",
                     "OSC_OUTPUT_ERROR_LOG_INTERVAL": "0",
+                    "PROMPT_TOKEN_BUDGET_FALLBACK": "approximate",
+                    "PROMPT_MAX_TOKENS": "1",
                 }
             )
 
@@ -209,6 +222,11 @@ class RuntimeConfigTests(unittest.TestCase):
             "OSC_OUTPUT_ERROR_LOG_INTERVAL must be greater than 0",
             errors,
         )
+        self.assertIn(
+            "PROMPT_TOKEN_BUDGET_FALLBACK must be one of: conservative, off",
+            errors,
+        )
+        self.assertIn("PROMPT_MAX_TOKENS must be at least 2", errors)
 
     def test_requires_a_real_groq_key_for_a_groq_backend(self):
         for key in ("", "your_groq_key_here"):

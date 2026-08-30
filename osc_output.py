@@ -32,6 +32,7 @@ class RuntimeStatusSnapshot:
     visual_mode: str
     prompt_style: str
     language: str
+    prompt_budget_mode: str
 
     def messages(self):
         return (
@@ -54,6 +55,7 @@ class RuntimeStatusSnapshot:
             OscMessage("/visual_mode", self.visual_mode),
             OscMessage("/prompt_style", self.prompt_style),
             OscMessage("/language", self.language),
+            OscMessage("/prompt_budget_mode", self.prompt_budget_mode),
         )
 
 

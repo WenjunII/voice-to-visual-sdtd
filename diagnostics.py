@@ -52,6 +52,7 @@ def run_diagnostics(
         _udp_bind_result(config.osc_control_ip, config.osc_control_port)
     )
     results.append(_model_cache_result(config.whisper_model_size))
+    results.append(_prompt_budget_result(config))
     results.append(
         _credential_result(
             "Groq credential",
@@ -223,6 +224,55 @@ def _model_cache_result(model_size):
     if openai_model.exists():
         return DiagnosticResult("Whisper model cache", "PASS", str(openai_model))
     return DiagnosticResult("Whisper model cache", "WARN", f"{model_size} will download on first use")
+
+
+def _prompt_budget_result(config, tokenizer_loader=None):
+    if not config.prompt_token_budget_enabled:
+        return DiagnosticResult(
+            "Prompt tokenizers",
+            "INFO",
+            "budgeting disabled",
+        )
+
+    if tokenizer_loader is None:
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer_loader = AutoTokenizer.from_pretrained
+        except Exception:
+            tokenizer_loader = None
+
+    missing = []
+    if tokenizer_loader is None:
+        missing = list(config.prompt_tokenizer_models)
+    else:
+        for model in config.prompt_tokenizer_models:
+            try:
+                tokenizer_loader(model, local_files_only=True)
+            except Exception:
+                missing.append(model)
+
+    total = len(config.prompt_tokenizer_models)
+    available = total - len(missing)
+    if not missing and total:
+        return DiagnosticResult(
+            "Prompt tokenizers",
+            "PASS",
+            f"{available}/{total} available locally; exact budgeting ready",
+        )
+
+    if config.prompt_token_budget_fallback == "conservative":
+        return DiagnosticResult(
+            "Prompt tokenizers",
+            "WARN",
+            f"{available}/{total} available locally; conservative offline "
+            "budgeting will be used",
+        )
+    return DiagnosticResult(
+        "Prompt tokenizers",
+        "FAIL",
+        f"{available}/{total} available locally and fallback is off",
+    )
 
 
 def _credential_result(name, configured):
