@@ -25,7 +25,11 @@ from osc_output import (
     OscOutputPublisher,
     RuntimeStatusSnapshot,
 )
-from prompt_engine import PromptBudgeter, RollingSceneMemory
+from prompt_engine import (
+    ConservativeUtf8Tokenizer,
+    PromptBudgeter,
+    RollingSceneMemory,
+)
 from runtime_config import (
     ConfigError,
     RuntimeConfig,
@@ -182,6 +186,7 @@ VISUAL_MODES = {
         "scene_context": "modern Asian-American neighborhoods and interiors, subtle traditional Asian cultural motifs, layered urban textures, natural cinematic atmosphere",
         "compact_context": "Asian-American US setting with subtle Asian cultural motifs",
         "compact_scene_context": "Asian-American US setting with subtle Asian cultural motifs and cinematic atmosphere",
+        "minimal_scene_context": "Asian-American setting",
     },
     "black_brown": {
         "label": "BLACK AND BROWN PEOPLE",
@@ -190,6 +195,7 @@ VISUAL_MODES = {
         "scene_context": "contemporary US neighborhoods shaped by Black and Brown diasporic culture, warm natural color palettes, rich textures, vibrant lived-in atmosphere",
         "compact_context": "Black and Brown diasporic US setting with warm tones and rich textures",
         "compact_scene_context": "Black and Brown diasporic US setting with warm colors and rich textures",
+        "minimal_scene_context": "Black and Brown setting",
     },
     "asian_black_brown": {
         "label": "ASIAN + BLACK AND BROWN PEOPLE",
@@ -198,6 +204,7 @@ VISUAL_MODES = {
         "scene_context": "diverse contemporary US community spaces shaped by Asian, Black, and Brown diasporic culture, layered cultural textures, vibrant lived-in atmosphere",
         "compact_context": "diverse Asian, Black, and Brown diasporic US community",
         "compact_scene_context": "diverse Asian, Black, and Brown diasporic US community spaces",
+        "minimal_scene_context": "Asian, Black, and Brown community",
     },
 }
 
@@ -205,6 +212,8 @@ FIXED_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic shot of {tex
 SCENE_PROMPT_TEMPLATE = "A hyper-realistic photorealistic cinematic scene of {text}, {visual_context}, environment-focused composition, no central human figure, no portrait framing, 8k UHD, highly detailed, masterfully lit, RAW photo, shot on 35mm lens, f/1.8, natural colors, masterpiece"
 COMPACT_FIXED_PROMPT_TEMPLATE = "Photorealistic cinematic scene: {text}, prominent {age_desc} {subject_focus}, {visual_context}, highly detailed, natural colors, masterfully lit, RAW 35mm photo, f/1.8, 8k"
 COMPACT_SCENE_PROMPT_TEMPLATE = "Photorealistic cinematic scene: {text}, {visual_context}, environment-focused, no central human figure, highly detailed, natural colors, masterfully lit, RAW 35mm photo, f/1.8, 8k"
+MINIMAL_FIXED_PROMPT_TEMPLATE = "Cinematic {text}, {age_desc} {subject_focus}"
+MINIMAL_SCENE_PROMPT_TEMPLATE = "Cinematic {text}, {visual_context}"
 
 PROMPT_STYLES = {
     "human_focus": {
@@ -392,7 +401,12 @@ class RealTimePipeline:
             max_words=self.config.scene_memory_max_words,
             max_age_seconds=self.config.scene_memory_max_age_seconds,
         )
-        self.prompt_budgeter = self.create_prompt_budgeter() if enable_prompt_budget else None
+        self.prompt_budget_mode = "disabled"
+        self.prompt_budgeter = (
+            self.create_prompt_budgeter()
+            if enable_prompt_budget
+            else None
+        )
         self.last_prompt_token_count = 0
         self.last_prompt_variant = "unbudgeted"
         self.last_prompt_trimmed = False
@@ -428,6 +442,7 @@ class RealTimePipeline:
                 "age": self.current_age,
                 "visual_mode": self.current_visual_mode,
                 "prompt_style": self.current_prompt_style,
+                "prompt_budget_mode": self.prompt_budget_mode,
                 "language": self.current_language or "auto",
                 "log_file": (
                     str(self.log_session.path)
@@ -557,6 +572,7 @@ class RealTimePipeline:
 
     def create_prompt_budgeter(self):
         if not self.config.prompt_token_budget_enabled:
+            self.prompt_budget_mode = "disabled"
             self.prompt_logger.info(
                 "Prompt token budgeting is disabled",
                 extra={"event": "prompt_budget_disabled"},
@@ -575,20 +591,46 @@ class RealTimePipeline:
                     "event": "prompt_budget_initialized",
                     "tokenizer_count": len(tokenizers),
                     "max_tokens": self.config.prompt_max_tokens,
+                    "budget_mode": "exact",
                 },
             )
+            self.prompt_budget_mode = "exact"
             return PromptBudgeter(
                 tokenizers,
                 max_tokens=self.config.prompt_max_tokens,
                 min_transcript_tokens=(
                     self.config.prompt_min_transcript_tokens
                 ),
+                mode="exact",
             )
         except Exception as exc:
+            if self.config.prompt_token_budget_fallback == "conservative":
+                self.prompt_budget_mode = "fallback"
+                self.prompt_logger.warning(
+                    "Prompt tokenizers unavailable; using conservative "
+                    "offline budgeting",
+                    extra={
+                        "event": "prompt_budget_fallback",
+                        "budget_mode": "fallback",
+                        "max_tokens": self.config.prompt_max_tokens,
+                        "error": self.clean_audio_error(exc),
+                    },
+                )
+                return PromptBudgeter(
+                    [ConservativeUtf8Tokenizer()],
+                    max_tokens=self.config.prompt_max_tokens,
+                    min_transcript_tokens=(
+                        self.config.prompt_min_transcript_tokens
+                    ),
+                    mode="fallback",
+                )
+
+            self.prompt_budget_mode = "unavailable"
             self.prompt_logger.warning(
                 "Prompt tokenizers unavailable; prompts will not be limited",
                 extra={
                     "event": "prompt_budget_unavailable",
+                    "budget_mode": "unavailable",
                     "error": self.clean_audio_error(exc),
                 },
             )
@@ -1081,6 +1123,7 @@ class RealTimePipeline:
             visual_mode=current_visual_mode,
             prompt_style=current_prompt_style,
             language=current_language,
+            prompt_budget_mode=self.prompt_budget_mode,
         )
         return self.output_publisher.publish_status(
             snapshot,
@@ -1109,6 +1152,7 @@ class RealTimePipeline:
         self.send_osc_message("/partial_text", raw_text)
         self.send_osc_message("/scene_context", text)
         self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
+        self.send_osc_message("/prompt_budget_mode", self.prompt_budget_mode)
         if is_final:
             self.send_osc_message("/transcript_final", raw_text)
 
@@ -1121,6 +1165,7 @@ class RealTimePipeline:
                 "scene_character_count": len(text),
                 "transcript_character_count": len(raw_text),
                 "prompt_tokens": self.last_prompt_token_count,
+                "prompt_budget_mode": self.prompt_budget_mode,
                 "prompt_variant": self.last_prompt_variant,
                 "transcript_trimmed": self.last_prompt_trimmed,
             },
@@ -1138,11 +1183,13 @@ class RealTimePipeline:
         final_prompt = self.build_visual_prompt(text)
         self.send_osc_message("/prompt", final_prompt)
         self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
+        self.send_osc_message("/prompt_budget_mode", self.prompt_budget_mode)
         self.prompt_logger.info(
             "Visual prompt refreshed after control change",
             extra={
                 "event": "prompt_refreshed",
                 "prompt_tokens": self.last_prompt_token_count,
+                "prompt_budget_mode": self.prompt_budget_mode,
                 "prompt_variant": self.last_prompt_variant,
             },
         )
@@ -1181,6 +1228,13 @@ class RealTimePipeline:
                         visual_context=visual_mode["compact_scene_context"],
                     ),
                 ),
+                (
+                    "minimal",
+                    lambda value: MINIMAL_SCENE_PROMPT_TEMPLATE.format(
+                        text=value,
+                        visual_context=visual_mode["minimal_scene_context"],
+                    ),
+                ),
             ]
         else:
             gender_focus = GENDER_MODES.get(current_gender, "person")
@@ -1214,6 +1268,14 @@ class RealTimePipeline:
                         text=value,
                     ),
                 ),
+                (
+                    "minimal",
+                    lambda value: MINIMAL_FIXED_PROMPT_TEMPLATE.format(
+                        age_desc=age_desc,
+                        subject_focus=subject_focus,
+                        text=value,
+                    ),
+                ),
             ]
 
         if self.prompt_budgeter is None:
@@ -1226,6 +1288,7 @@ class RealTimePipeline:
         self.last_prompt_token_count = result.token_count
         self.last_prompt_variant = result.variant
         self.last_prompt_trimmed = result.transcript_trimmed
+        self.prompt_budget_mode = result.budget_mode
         if self.config.prompt_log_tokens:
             trimmed = ", newest transcript retained" if result.transcript_trimmed else ""
             self.prompt_logger.info(
@@ -1234,6 +1297,7 @@ class RealTimePipeline:
                     "event": "prompt_budget_measured",
                     "token_count": result.token_count,
                     "max_tokens": self.config.prompt_max_tokens,
+                    "budget_mode": result.budget_mode,
                     "variant": result.variant,
                     "transcript_trimmed": result.transcript_trimmed,
                     "detail": trimmed.lstrip(", "),

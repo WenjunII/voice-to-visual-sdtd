@@ -22,14 +22,14 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
-- **Exact SDXL Prompt Budgeting**: Checks both SDXL CLIP tokenizers and switches to compact prompt wording when necessary so prompts stay inside the 77-token context window.
+- **Offline-Safe SDXL Prompt Budgeting**: Uses both exact SDXL CLIP tokenizers when cached, then automatically falls back to a conservative network-free upper bound so tokenizer download or cache failures cannot silently produce oversized prompts.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
 - **Resilient OSC Output**: Isolates UDP delivery failures from audio and transcription, rate-limits outage logs, reports recovery, and exposes an in-memory publisher for deterministic protocol and replay tests.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
 - **Structured Session Logging**: Labels operational events by subsystem, captures latency/retry/reconnection metrics, optionally rotates JSON Lines log files, and redacts configured credentials.
 - **Graceful Worker Shutdown**: Uses cooperative cancellation, owned non-daemon workers, interruptible retry waits, and ordered cleanup so backend and log resources stay open until audio and transcription stop.
-- **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model cache, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
+- **Startup Diagnostics**: Checks CUDA, cuDNN, the microphone, packages, model and prompt-tokenizer caches, OSC input port, local credential presence, and `.env` Git-ignore status without printing secrets.
 
 ## Tech Stack
 
@@ -43,7 +43,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 
 The system keeps the original human-focused template and adds a second scene-focused template for moments when you want the visuals to describe a place, mood, or environment instead of centering a person.
 
-Both original templates remain available as the high-detail variants. When a complete prompt would exceed SDXL's context window, the bridge automatically uses a compact equivalent and retains the newest transcript details. Token limits are checked against both SDXL text encoders.
+Both original templates remain available as the high-detail variants. When a complete prompt would exceed SDXL's context window, the bridge automatically uses compact or minimal equivalents and retains the newest transcript details. Cached tokenizers provide exact counts across both SDXL text encoders. If they cannot load, conservative offline budgeting remains active instead of sending an unbounded prompt.
 
 Human figure focus:
 
@@ -215,6 +215,8 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     # Enforce both SDXL CLIP encoders' prompt limit.
     PROMPT_TOKEN_BUDGET_ENABLED=true
+    # Network-free safety fallback when exact tokenizer files are unavailable.
+    PROMPT_TOKEN_BUDGET_FALLBACK=conservative
     PROMPT_MAX_TOKENS=77
     PROMPT_MIN_TRANSCRIPT_TOKENS=20
     PROMPT_LOG_TOKENS=true
@@ -317,7 +319,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     The faster-whisper dependency profile pins CTranslate2 `4.4.0` for this project's current Windows CUDA 12 + cuDNN 8 setup. Silero VAD runs on the CPU. If Silero cannot load, the script reports the problem and automatically uses the energy detector.
 
-    The first `faster_whisper` run downloads and caches its converted Whisper model. Prompt budgeting also caches two small tokenizer configurations. Later launches reuse both local caches.
+    The first `faster_whisper` run downloads and caches its converted Whisper model. Prompt budgeting also caches two small tokenizer configurations. Later launches reuse both local caches. Until both tokenizer caches are ready, conservative offline budgeting keeps prompts bounded and reports `fallback` mode through logs and OSC.
 
     You can also override the backend for the current PowerShell session:
     ```powershell
@@ -359,6 +361,12 @@ Replay accepts mono or multichannel PCM input at any valid sample rate. It conve
 
 `--replay` cannot be combined with `--benchmark` or `--input-device`. Benchmark mode calls the selected local model repeatedly to measure performance; replay mode processes the recording once through the complete streaming system.
 
+### Prompt Budgeting Modes
+
+With `PROMPT_TOKEN_BUDGET_ENABLED=true`, the runtime first loads every model in `PROMPT_TOKENIZER_MODELS`. When they are available, `exact` mode measures the prompt against both SDXL CLIP tokenizers. If an import, download, or cache error occurs, the default `PROMPT_TOKEN_BUDGET_FALLBACK=conservative` mode uses a UTF-8 byte upper bound for CLIP's byte-level tokenization, including its two boundary tokens. This fallback can select a minimal prompt variant and retain the newest transcript suffix without network or model files.
+
+The runtime exposes `exact`, `fallback`, `disabled`, or `unavailable` through `/prompt_budget_mode` and structured prompt logs. `/prompt_tokens` is the maximum exact count in `exact` mode and the conservative upper-bound count in `fallback` mode. Set `PROMPT_TOKEN_BUDGET_FALLBACK=off` only when intentionally accepting unbounded prompts after tokenizer failure. `python transcriber.py --diagnose` checks both configured tokenizers with local-only loading and reports whether exact or fallback budgeting would be used.
+
 ### Runtime Logging
 
 Operational events use `debug`, `info`, `warning`, `error`, or `critical` levels and identify their subsystem, including `audio`, `backend`, `transcription`, `scheduler`, `prompt`, `osc`, and `control`. Console logs remain human-readable. Set `RUNTIME_LOG_FILE` to enable persistent JSON Lines logs:
@@ -389,7 +397,8 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 | `/prompt` | Complete SDXL prompt |
 | `/partial_text` | Current stable transcript |
 | `/scene_context` | Rolling merged scene text |
-| `/prompt_tokens` | Maximum token count across both SDXL text encoders |
+| `/prompt_tokens` | Maximum exact CLIP count, or the conservative upper-bound count in fallback mode |
+| `/prompt_budget_mode` | `exact`, `fallback`, `disabled`, or `unavailable` |
 | `/transcript_final` | Finalized transcript segment |
 | `/backend_status` | `ready`, `transcribing`, `retrying`, `error`, or `stopped` |
 | `/backend` | Active transcription backend |
@@ -427,7 +436,7 @@ Send these messages to `127.0.0.1:7001`. Text values accept the names below or t
 | `/control/reset_scene` | Any value; clears rolling scene memory |
 | `/control/request_status` | Any value; immediately emits all runtime status addresses |
 
-Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes all five active mode addresses so a TouchDesigner interface can resynchronize after either process restarts.
+Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes the five active control modes plus `/prompt_budget_mode` so a TouchDesigner interface can resynchronize after either process restarts.
 
 ## Runtime Structure
 
@@ -465,7 +474,7 @@ pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile and missing microphone dependency instead of failing during import.
+Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
 ## License
 

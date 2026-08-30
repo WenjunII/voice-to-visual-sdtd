@@ -225,6 +225,7 @@ class RealTimePipelineControlTests(unittest.TestCase):
         self.assertEqual(len(prompt_messages), 1)
         self.assertIn("adult Black or Brown person", prompt_messages[0])
         self.assertIn(("/prompt_tokens", 0), messages)
+        self.assertIn(("/prompt_budget_mode", "disabled"), messages)
         pipeline.send_runtime_status.assert_called_once_with(force=True)
 
     def test_language_control_does_not_rebuild_the_visual_prompt(self):
@@ -260,6 +261,7 @@ class RealTimePipelineControlTests(unittest.TestCase):
             ("/visual_mode", "asian_black_brown"),
             ("/prompt_style", "general_scene"),
             ("/language", "zh"),
+            ("/prompt_budget_mode", "disabled"),
         }
         calls = {
             (message.address, message.value)
@@ -424,15 +426,29 @@ class WavReplayPipelineTests(unittest.TestCase):
         adapter.transcribe.assert_called_once()
         self.assertEqual(pipeline.last_text, "adapter transcript")
         self.assertFalse(source._open)
+        prompt_start = next(
+            index
+            for index, message in enumerate(publisher.messages)
+            if message.address == "/prompt"
+        )
+        transcript_end = next(
+            index
+            for index, message in enumerate(
+                publisher.messages[prompt_start:],
+                start=prompt_start,
+            )
+            if message.address == "/transcript_final"
+        )
         transcript_messages = [
             (message.address, message.value)
-            for message in publisher.messages
+            for message in publisher.messages[prompt_start:transcript_end + 1]
             if message.address
             in {
                 "/prompt",
                 "/partial_text",
                 "/scene_context",
                 "/prompt_tokens",
+                "/prompt_budget_mode",
                 "/transcript_final",
             }
         ]
@@ -443,12 +459,13 @@ class WavReplayPipelineTests(unittest.TestCase):
                 "/partial_text",
                 "/scene_context",
                 "/prompt_tokens",
+                "/prompt_budget_mode",
                 "/transcript_final",
             ],
         )
         self.assertEqual(transcript_messages[1][1], "adapter transcript")
         self.assertEqual(transcript_messages[2][1], "adapter transcript")
-        self.assertEqual(transcript_messages[4][1], "adapter transcript")
+        self.assertEqual(transcript_messages[5][1], "adapter transcript")
         pipeline.close()
 
 
@@ -635,10 +652,73 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             ["tokenizer-a", "tokenizer-b"],
         )
         self.assertEqual(pipeline.prompt_budgeter.max_tokens, 61)
+        self.assertEqual(pipeline.prompt_budgeter.mode, "exact")
+        self.assertEqual(pipeline.prompt_budget_mode, "exact")
         self.assertEqual(
             pipeline.prompt_budgeter.min_transcript_tokens,
             17,
         )
+
+    def test_uses_conservative_budgeting_when_tokenizers_are_unavailable(self):
+        config = replace(
+            RuntimeConfig(),
+            prompt_max_tokens=77,
+            prompt_token_budget_fallback="conservative",
+        )
+        transformers = types.ModuleType("transformers")
+
+        with patch.dict(sys.modules, {"transformers": transformers}):
+            pipeline = RealTimePipeline(
+                enable_vad=False,
+                enable_osc=False,
+                enable_prompt_budget=True,
+                enable_osc_controls=False,
+                config=config,
+                backend_adapter=make_backend_adapter(),
+                log_session=TestLogSession(),
+            )
+
+        prompt = pipeline.build_visual_prompt(
+            "旧场景变成一个霓虹森林 with a very long cinematic description"
+        )
+
+        self.assertEqual(pipeline.prompt_budget_mode, "fallback")
+        self.assertEqual(pipeline.prompt_budgeter.mode, "fallback")
+        self.assertLessEqual(pipeline.last_prompt_token_count, 77)
+        self.assertEqual(
+            pipeline.last_prompt_token_count,
+            len(prompt.encode("utf-8")) + 2,
+        )
+        self.assertEqual(pipeline.last_prompt_variant, "minimal")
+        self.assertIn("a very long cinematic description", prompt)
+        fallback_log = pipeline.prompt_logger.warning.call_args
+        self.assertEqual(
+            fallback_log.kwargs["extra"]["event"],
+            "prompt_budget_fallback",
+        )
+        pipeline.close()
+
+    def test_can_explicitly_disable_the_offline_budget_fallback(self):
+        config = replace(
+            RuntimeConfig(),
+            prompt_token_budget_fallback="off",
+        )
+        transformers = types.ModuleType("transformers")
+
+        with patch.dict(sys.modules, {"transformers": transformers}):
+            pipeline = RealTimePipeline(
+                enable_vad=False,
+                enable_osc=False,
+                enable_prompt_budget=True,
+                enable_osc_controls=False,
+                config=config,
+                backend_adapter=make_backend_adapter(),
+                log_session=TestLogSession(),
+            )
+
+        self.assertIsNone(pipeline.prompt_budgeter)
+        self.assertEqual(pipeline.prompt_budget_mode, "unavailable")
+        pipeline.close()
 
     def test_transcription_retries_use_the_pipeline_configuration(self):
         config = replace(

@@ -17,6 +17,7 @@ SUPPORTED_VISUAL_MODES = {
 SUPPORTED_PROMPT_STYLES = {"general_scene", "human_focus"}
 SUPPORTED_LANGUAGES = {"auto", "en", "es", "zh"}
 SUPPORTED_PROMPT_REFINEMENT_PROVIDERS = {"capriole", "ollama"}
+SUPPORTED_PROMPT_BUDGET_FALLBACKS = {"conservative", "off"}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 NORMALIZED_ENV_NAMES = {
@@ -31,6 +32,7 @@ NORMALIZED_ENV_NAMES = {
     "HYBRID_TRANSLATION_FALLBACK",
     "VAD_ENGINE",
     "RUNTIME_LOG_LEVEL",
+    "PROMPT_TOKEN_BUDGET_FALLBACK",
     "DEFAULT_GENDER",
     "DEFAULT_AGE",
     "DEFAULT_VISUAL_MODE",
@@ -157,6 +159,9 @@ class RuntimeConfig:
     )
     prompt_token_budget_enabled: bool = _config_field(
         "PROMPT_TOKEN_BUDGET_ENABLED", True
+    )
+    prompt_token_budget_fallback: str = _config_field(
+        "PROMPT_TOKEN_BUDGET_FALLBACK", "conservative"
     )
     prompt_max_tokens: int = _config_field("PROMPT_MAX_TOKENS", 77)
     prompt_min_transcript_tokens: int = _config_field(
@@ -554,11 +559,19 @@ class RuntimeConfig:
             errors.append(
                 "PROMPT_MIN_TRANSCRIPT_TOKENS must not exceed PROMPT_MAX_TOKENS"
             )
+        if self.prompt_max_tokens < 2:
+            errors.append("PROMPT_MAX_TOKENS must be at least 2")
         if self.prompt_token_budget_enabled and not self.prompt_tokenizer_models:
             errors.append(
                 "PROMPT_TOKENIZER_MODELS must include at least one model when "
                 "PROMPT_TOKEN_BUDGET_ENABLED is true"
             )
+        self._validate_choice(
+            errors,
+            "PROMPT_TOKEN_BUDGET_FALLBACK",
+            self.prompt_token_budget_fallback,
+            SUPPORTED_PROMPT_BUDGET_FALLBACKS,
+        )
 
         refinement_providers = set()
         if not self.prompt_refinement_chain:

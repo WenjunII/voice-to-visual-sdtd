@@ -9,6 +9,7 @@ class BudgetedPrompt:
     token_count: int
     variant: str
     transcript_trimmed: bool
+    budget_mode: str = "exact"
 
 
 class RollingSceneMemory:
@@ -64,17 +65,59 @@ class RollingSceneMemory:
         return list(words[-self.max_words:])
 
 
+class ConservativeUtf8Tokenizer:
+    """Upper-bound CLIP token usage without model files or network access.
+
+    CLIP's byte-level BPE begins with UTF-8 bytes and only merges them, so one
+    token per byte plus the two boundary tokens is deliberately conservative.
+    """
+
+    START_TOKEN = -1
+    END_TOKEN = -2
+
+    def encode(
+        self,
+        text,
+        add_special_tokens=True,
+        truncation=False,
+        max_length=None,
+    ):
+        token_ids = list(str(text).encode("utf-8"))
+        if add_special_tokens:
+            token_ids = [self.START_TOKEN, *token_ids, self.END_TOKEN]
+        if truncation and max_length is not None:
+            token_ids = token_ids[:max_length]
+        return token_ids
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        byte_values = [
+            token_id
+            for token_id in token_ids
+            if isinstance(token_id, int) and 0 <= token_id <= 255
+        ]
+        return bytes(byte_values).decode("utf-8", errors="ignore")
+
+
 class PromptBudgeter:
     """Fit prompts within every configured tokenizer's context window."""
 
-    def __init__(self, tokenizers, max_tokens=77, min_transcript_tokens=20):
+    def __init__(
+        self,
+        tokenizers,
+        max_tokens=77,
+        min_transcript_tokens=20,
+        mode="exact",
+    ):
         if not tokenizers:
             raise ValueError("at least one tokenizer is required")
-        if max_tokens < 1:
-            raise ValueError("max_tokens must be positive")
+        if max_tokens < 2:
+            raise ValueError("max_tokens must allow the two CLIP boundary tokens")
+        if mode not in {"exact", "fallback"}:
+            raise ValueError("budget mode must be exact or fallback")
         self.tokenizers = list(tokenizers)
         self.max_tokens = max_tokens
         self.min_transcript_tokens = max(0, min_transcript_tokens)
+        self.mode = mode
 
     def token_count(self, text):
         return max(len(tokenizer.encode(text, truncation=False)) for tokenizer in self.tokenizers)
@@ -89,7 +132,13 @@ class PromptBudgeter:
             full_prompt = _clean_prompt(render(transcript))
             full_count = self.token_count(full_prompt)
             if full_count <= self.max_tokens:
-                return BudgetedPrompt(full_prompt, full_count, name, False)
+                return BudgetedPrompt(
+                    full_prompt,
+                    full_count,
+                    name,
+                    False,
+                    self.mode,
+                )
 
             static_prompt = _clean_prompt(render(""))
             static_count = self.token_count(static_prompt)
@@ -112,6 +161,7 @@ class PromptBudgeter:
             token_count=token_count,
             variant=name,
             transcript_trimmed=candidate.strip() != transcript.strip(),
+            budget_mode=self.mode,
         )
 
     def _longest_fitting_suffix(self, render, transcript):
