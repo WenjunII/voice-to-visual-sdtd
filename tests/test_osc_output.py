@@ -32,6 +32,8 @@ def make_snapshot(**changes):
         "prompt_style": "human_focus",
         "language": "auto",
         "prompt_budget_mode": "exact",
+        "dropped_final_oldest": 2,
+        "dropped_final_newest": 1,
     }
     values.update(changes)
     return RuntimeStatusSnapshot(**values)
@@ -64,6 +66,8 @@ class RuntimeStatusSnapshotTests(unittest.TestCase):
                 "/prompt_style",
                 "/language",
                 "/prompt_budget_mode",
+                "/dropped_final_oldest",
+                "/dropped_final_newest",
             ],
         )
         self.assertEqual(messages[2], OscMessage("/is_speaking", 1))
@@ -106,7 +110,7 @@ class OscOutputPublisherTests(unittest.TestCase):
         self.assertTrue(
             publisher.publish_status(make_snapshot(), force=True)
         )
-        self.assertEqual(client.send_message.call_count, 40)
+        self.assertEqual(client.send_message.call_count, 44)
 
     def test_delivery_errors_are_isolated_rate_limited_and_recoverable(self):
         client = Mock()

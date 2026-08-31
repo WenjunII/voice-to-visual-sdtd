@@ -18,7 +18,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Explicit Microphone Selection**: List available input devices and pin live capture and diagnostics to a specific PyAudio device index, or keep following the Windows system default.
 - **Audio Source Adapters & WAV Replay**: Keeps microphone ownership outside the pipeline and can replay a recording through the real VAD, segmentation, scheduling, transcription, prompt, logging, and OSC path without audio hardware.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
-- **Backpressure-Aware Scheduling**: Final speech is prioritized in a bounded queue while obsolete partial snapshots are replaced, preventing latency from growing during continuous speech.
+- **Freshness-First Backpressure**: Final speech is prioritized in a bounded queue, obsolete partial snapshots are replaced, and the default overflow policy evicts the oldest pending final so visuals follow the newest spoken intent.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
@@ -177,6 +177,8 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     # Bounded scheduler: finals have priority and obsolete partials are replaced.
     TRANSCRIPTION_MAX_FINAL_JOBS=8
+    # drop_oldest favors live visual freshness; drop_newest preserves queued FIFO history.
+    TRANSCRIPTION_FINAL_OVERFLOW_POLICY=drop_oldest
     TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS=4.0
     TRANSCRIPTION_FINAL_MAX_AGE_SECONDS=30.0
     TRANSCRIPTION_FINAL_MAX_RETRIES=2
@@ -361,6 +363,12 @@ Replay accepts mono or multichannel PCM input at any valid sample rate. It conve
 
 `--replay` cannot be combined with `--benchmark` or `--input-device`. Benchmark mode calls the selected local model repeatedly to measure performance; replay mode processes the recording once through the complete streaming system.
 
+### Freshness-First Queue Backpressure
+
+`TRANSCRIPTION_MAX_FINAL_JOBS` bounds finalized speech waiting for transcription. When that queue fills, the default `TRANSCRIPTION_FINAL_OVERFLOW_POLICY=drop_oldest` discards the oldest pending final and admits the newest speech, keeping a live visual performance aligned with the speaker's current intent. Set the policy to `drop_newest` when preserving the already queued FIFO history matters more than freshness.
+
+An older transcription retry never evicts newer queued speech under either policy. Stale jobs, oldest capacity drops, and newest capacity drops are counted separately; `/dropped_jobs` remains the backward-compatible total. Structured scheduler logs identify the dropped segment, incoming segment, source, and active policy.
+
 ### Prompt Budgeting Modes
 
 With `PROMPT_TOKEN_BUDGET_ENABLED=true`, the runtime first loads every model in `PROMPT_TOKENIZER_MODELS`. When they are available, `exact` mode measures the prompt against both SDXL CLIP tokenizers. If an import, download, or cache error occurs, the default `PROMPT_TOKEN_BUDGET_FALLBACK=conservative` mode uses a UTF-8 byte upper bound for CLIP's byte-level tokenization, including its two boundary tokens. This fallback can select a minimal prompt variant and retain the newest transcript suffix without network or model files.
@@ -408,6 +416,8 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 | `/latency_asr` | Seconds spent in the active ASR/translation call |
 | `/retry_in` | Seconds until a rate-limited or transiently unavailable backend may be called again |
 | `/dropped_jobs` | Total stale or capacity-dropped jobs |
+| `/dropped_final_oldest` | Oldest finals or retries discarded at queue capacity |
+| `/dropped_final_newest` | Incoming finals rejected at queue capacity |
 | `/audio_status` | `starting`, `ready`, `degraded`, `reconnecting`, `error`, or `stopped` |
 | `/audio_source` | `microphone` or `wav_replay` |
 | `/audio_reconnects` | Total microphone reopen attempts during this run |
@@ -448,7 +458,7 @@ Accepted changes return `/control_ack`; scene resets additionally emit `/scene_r
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
 - `audio_runtime.py` owns CPU voice activity detectors.
-- `runtime_scheduler.py` owns bounded final/partial scheduling and queue metrics.
+- `runtime_scheduler.py` owns configurable freshness/FIFO overflow handling, bounded final/partial scheduling, retry protection, and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
 - `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, outage/recovery logging, and in-memory test publisher.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.

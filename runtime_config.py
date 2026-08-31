@@ -18,6 +18,7 @@ SUPPORTED_PROMPT_STYLES = {"general_scene", "human_focus"}
 SUPPORTED_LANGUAGES = {"auto", "en", "es", "zh"}
 SUPPORTED_PROMPT_REFINEMENT_PROVIDERS = {"capriole", "ollama"}
 SUPPORTED_PROMPT_BUDGET_FALLBACKS = {"conservative", "off"}
+SUPPORTED_FINAL_OVERFLOW_POLICIES = {"drop_oldest", "drop_newest"}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 NORMALIZED_ENV_NAMES = {
@@ -33,6 +34,7 @@ NORMALIZED_ENV_NAMES = {
     "VAD_ENGINE",
     "RUNTIME_LOG_LEVEL",
     "PROMPT_TOKEN_BUDGET_FALLBACK",
+    "TRANSCRIPTION_FINAL_OVERFLOW_POLICY",
     "DEFAULT_GENDER",
     "DEFAULT_AGE",
     "DEFAULT_VISUAL_MODE",
@@ -238,6 +240,9 @@ class RuntimeConfig:
 
     transcription_max_final_jobs: int = _config_field(
         "TRANSCRIPTION_MAX_FINAL_JOBS", 8
+    )
+    transcription_final_overflow_policy: str = _config_field(
+        "TRANSCRIPTION_FINAL_OVERFLOW_POLICY", "drop_oldest"
     )
     transcription_partial_max_age_seconds: float = _config_field(
         "TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS", 4.0
@@ -467,6 +472,12 @@ class RuntimeConfig:
             "DEFAULT_LANGUAGE",
             self.default_language,
             SUPPORTED_LANGUAGES,
+        )
+        self._validate_choice(
+            errors,
+            "TRANSCRIPTION_FINAL_OVERFLOW_POLICY",
+            self.transcription_final_overflow_policy,
+            SUPPORTED_FINAL_OVERFLOW_POLICIES,
         )
 
         self._require_positive(

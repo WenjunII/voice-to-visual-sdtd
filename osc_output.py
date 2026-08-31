@@ -33,6 +33,8 @@ class RuntimeStatusSnapshot:
     prompt_style: str
     language: str
     prompt_budget_mode: str
+    dropped_final_oldest: int
+    dropped_final_newest: int
 
     def messages(self):
         return (
@@ -56,6 +58,8 @@ class RuntimeStatusSnapshot:
             OscMessage("/prompt_style", self.prompt_style),
             OscMessage("/language", self.language),
             OscMessage("/prompt_budget_mode", self.prompt_budget_mode),
+            OscMessage("/dropped_final_oldest", self.dropped_final_oldest),
+            OscMessage("/dropped_final_newest", self.dropped_final_newest),
         )
 
 
