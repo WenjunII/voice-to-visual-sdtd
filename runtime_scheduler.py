@@ -1,6 +1,10 @@
 import threading
 from collections import deque
 from dataclasses import dataclass, replace
+from typing import Optional
+
+
+FINAL_OVERFLOW_POLICIES = {"drop_oldest", "drop_newest"}
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,20 @@ class ScheduledJob:
 
 
 @dataclass(frozen=True)
+class FinalJobSubmission:
+    job: Optional[ScheduledJob]
+    dropped_job: Optional[ScheduledJob] = None
+    drop_reason: str = ""
+
+    @property
+    def accepted(self):
+        return self.job is not None
+
+    def __bool__(self):
+        return self.accepted
+
+
+@dataclass(frozen=True)
 class SchedulerMetrics:
     queue_depth: int
     final_queue_depth: int
@@ -26,6 +44,8 @@ class SchedulerMetrics:
     replaced_partials: int
     dropped_stale: int
     dropped_finals: int
+    dropped_final_oldest: int
+    dropped_final_newest: int
     retries: int
     processed: int
     failed: int
@@ -37,12 +57,19 @@ class RealtimeJobScheduler:
     def __init__(
         self,
         max_final_jobs=8,
+        final_overflow_policy="drop_oldest",
         partial_max_age_seconds=4.0,
         final_max_age_seconds=30.0,
     ):
         if max_final_jobs < 1:
             raise ValueError("max_final_jobs must be positive")
+        if final_overflow_policy not in FINAL_OVERFLOW_POLICIES:
+            raise ValueError(
+                "final_overflow_policy must be one of: "
+                + ", ".join(sorted(FINAL_OVERFLOW_POLICIES))
+            )
         self.max_final_jobs = max_final_jobs
+        self.final_overflow_policy = final_overflow_policy
         self.partial_max_age_seconds = partial_max_age_seconds
         self.final_max_age_seconds = final_max_age_seconds
         self._finals = deque()
@@ -54,7 +81,8 @@ class RealtimeJobScheduler:
         self._submitted_partials = 0
         self._replaced_partials = 0
         self._dropped_stale = 0
-        self._dropped_finals = 0
+        self._dropped_final_oldest = 0
+        self._dropped_final_newest = 0
         self._retries = 0
         self._processed = 0
         self._failed = 0
@@ -67,13 +95,26 @@ class RealtimeJobScheduler:
                 and self._partial.segment.segment_id == segment.segment_id
             ):
                 self._partial = None
-            if len(self._finals) >= self.max_final_jobs:
-                self._dropped_finals += 1
-                return None
             job = self._new_job(segment, now)
+            if len(self._finals) >= self.max_final_jobs:
+                if self.final_overflow_policy == "drop_newest":
+                    self._dropped_final_newest += 1
+                    return FinalJobSubmission(
+                        job=None,
+                        dropped_job=job,
+                        drop_reason="newest_capacity",
+                    )
+                dropped_job = self._drop_oldest_final_locked()
+                self._dropped_final_oldest += 1
+            else:
+                dropped_job = None
             self._finals.append(job)
             self._submitted_finals += 1
-            return job
+            return FinalJobSubmission(
+                job=job,
+                dropped_job=dropped_job,
+                drop_reason=("oldest_capacity" if dropped_job else ""),
+            )
 
     def submit_partial(self, segment, now):
         with self._lock:
@@ -103,12 +144,23 @@ class RealtimeJobScheduler:
 
     def retry_final(self, job, now, delay_seconds):
         if not job.is_final:
-            return False
+            return FinalJobSubmission(job=None)
         with self._lock:
             self._purge_stale_locked(now)
-            if self._is_stale(job, now) or len(self._finals) >= self.max_final_jobs:
-                self._dropped_finals += 1
-                return False
+            if self._is_stale(job, now):
+                self._dropped_stale += 1
+                return FinalJobSubmission(
+                    job=None,
+                    dropped_job=job,
+                    drop_reason="stale",
+                )
+            if len(self._finals) >= self.max_final_jobs:
+                self._dropped_final_oldest += 1
+                return FinalJobSubmission(
+                    job=None,
+                    dropped_job=job,
+                    drop_reason="oldest_capacity",
+                )
             retried = replace(
                 job,
                 ready_at=now + max(0.0, delay_seconds),
@@ -116,7 +168,7 @@ class RealtimeJobScheduler:
             )
             self._finals.appendleft(retried)
             self._retries += 1
-            return True
+            return FinalJobSubmission(job=retried)
 
     def mark_processed(self):
         with self._lock:
@@ -138,7 +190,12 @@ class RealtimeJobScheduler:
                 submitted_partials=self._submitted_partials,
                 replaced_partials=self._replaced_partials,
                 dropped_stale=self._dropped_stale,
-                dropped_finals=self._dropped_finals,
+                dropped_finals=(
+                    self._dropped_final_oldest
+                    + self._dropped_final_newest
+                ),
+                dropped_final_oldest=self._dropped_final_oldest,
+                dropped_final_newest=self._dropped_final_newest,
                 retries=self._retries,
                 processed=self._processed,
                 failed=self._failed,
@@ -153,6 +210,18 @@ class RealtimeJobScheduler:
         )
         self._next_job_id += 1
         return job
+
+    def _drop_oldest_final_locked(self):
+        oldest_index = min(
+            range(len(self._finals)),
+            key=lambda index: (
+                self._finals[index].created_at,
+                self._finals[index].job_id,
+            ),
+        )
+        dropped_job = self._finals[oldest_index]
+        del self._finals[oldest_index]
+        return dropped_job
 
     def _purge_stale_locked(self, now):
         retained = deque()

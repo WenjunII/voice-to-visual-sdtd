@@ -389,6 +389,9 @@ class RealTimePipeline:
         )
         self.scheduler = RealtimeJobScheduler(
             max_final_jobs=self.config.transcription_max_final_jobs,
+            final_overflow_policy=(
+                self.config.transcription_final_overflow_policy
+            ),
             partial_max_age_seconds=(
                 self.config.transcription_partial_max_age_seconds
             ),
@@ -711,15 +714,36 @@ class RealTimePipeline:
 
         now = time.monotonic()
         for segment in completed:
-            if self.scheduler.submit_final(segment, now) is None:
-                self.scheduler_logger.warning(
-                    "Final queue is full; newest segment was dropped",
-                    extra={
-                        "event": "scheduler_final_dropped",
-                        "segment_id": segment.segment_id,
-                    },
-                )
+            self.submit_final_segment(segment, now, source="completed")
         self.send_runtime_status()
+
+    def submit_final_segment(self, segment, now, *, source):
+        submission = self.scheduler.submit_final(segment, now)
+        dropped_job = submission.dropped_job
+        if dropped_job is None:
+            return submission
+
+        self.cleanup_final_job(dropped_job)
+        extra = {
+            "segment_id": dropped_job.segment.segment_id,
+            "incoming_segment_id": segment.segment_id,
+            "source": source,
+            "overflow_policy": self.scheduler.final_overflow_policy,
+        }
+        if submission.drop_reason == "oldest_capacity":
+            extra["event"] = "scheduler_final_oldest_dropped"
+            self.scheduler_logger.warning(
+                "Final queue is full; oldest pending segment was dropped "
+                "for fresher speech",
+                extra=extra,
+            )
+        else:
+            extra["event"] = "scheduler_final_newest_dropped"
+            self.scheduler_logger.warning(
+                "Final queue is full; newest segment was dropped",
+                extra=extra,
+            )
+        return submission
 
     def wait_for_audio_retry(self, delay_seconds):
         return not self.stop_event.wait(max(0.0, delay_seconds))
@@ -729,14 +753,11 @@ class RealTimePipeline:
             segment = self.segmenter.interrupt()
         if segment is None or segment.samples.size == 0:
             return
-        if self.scheduler.submit_final(segment, time.monotonic()) is None:
-            self.scheduler_logger.warning(
-                "Final queue is full; interrupted audio was dropped",
-                extra={
-                    "event": "scheduler_interrupted_audio_dropped",
-                    "segment_id": segment.segment_id,
-                },
-            )
+        self.submit_final_segment(
+            segment,
+            time.monotonic(),
+            source="interrupted",
+        )
 
     def audio_callback(self):
         reconnect_attempt = 0
@@ -1057,7 +1078,12 @@ class RealTimePipeline:
 
         max_retries = self.config.transcription_final_max_retries
         should_retry = job.is_final and job.attempts < max_retries
-        if should_retry and self.scheduler.retry_final(job, now, retry_delay):
+        retry_submission = (
+            self.scheduler.retry_final(job, now, retry_delay)
+            if should_retry
+            else None
+        )
+        if retry_submission:
             self.backend_status = "retrying"
             self.transcription_logger.warning(
                 "Final transcription segment scheduled for retry",
@@ -1071,15 +1097,38 @@ class RealTimePipeline:
                 },
             )
         else:
+            drop_reason = getattr(retry_submission, "drop_reason", "")
+            if drop_reason == "oldest_capacity":
+                self.scheduler_logger.warning(
+                    "Older retry was dropped to preserve fresher queued speech",
+                    extra={
+                        "event": "scheduler_final_oldest_dropped",
+                        "segment_id": job.segment.segment_id,
+                        "source": "retry",
+                        "overflow_policy": (
+                            self.scheduler.final_overflow_policy
+                        ),
+                    },
+                )
             self.scheduler.mark_failed()
             self.backend_status = "error"
             self.cleanup_final_job(job)
+            capacity_drop = drop_reason == "oldest_capacity"
             self.transcription_logger.error(
-                "Transcription retries exhausted",
+                (
+                    "Final transcription retry dropped because the queue is full"
+                    if capacity_drop
+                    else "Transcription retries exhausted"
+                ),
                 extra={
-                    "event": "transcription_retry_exhausted",
+                    "event": (
+                        "transcription_retry_capacity_dropped"
+                        if capacity_drop
+                        else "transcription_retry_exhausted"
+                    ),
                     "segment_id": job.segment.segment_id,
                     "attempts": job.attempts,
+                    "drop_reason": drop_reason,
                     "error": self.clean_audio_error(exc),
                 },
             )
@@ -1124,6 +1173,8 @@ class RealTimePipeline:
             prompt_style=current_prompt_style,
             language=current_language,
             prompt_budget_mode=self.prompt_budget_mode,
+            dropped_final_oldest=metrics.dropped_final_oldest,
+            dropped_final_newest=metrics.dropped_final_newest,
         )
         return self.output_publisher.publish_status(
             snapshot,
@@ -1558,6 +1609,12 @@ class RealTimePipeline:
                         "failed_jobs": metrics.failed,
                         "dropped_jobs": (
                             metrics.dropped_stale + metrics.dropped_finals
+                        ),
+                        "dropped_final_oldest": (
+                            metrics.dropped_final_oldest
+                        ),
+                        "dropped_final_newest": (
+                            metrics.dropped_final_newest
                         ),
                     },
                 )

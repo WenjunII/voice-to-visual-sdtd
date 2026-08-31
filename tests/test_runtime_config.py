@@ -27,6 +27,10 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(config.runtime_log_console_enabled)
         self.assertEqual(config.runtime_log_file, "")
         self.assertEqual(config.runtime_shutdown_grace_seconds, 25.0)
+        self.assertEqual(
+            config.transcription_final_overflow_policy,
+            "drop_oldest",
+        )
         self.assertEqual(config.audio_input_device_index, None)
         self.assertEqual(config.default_gender, "neutral")
         self.assertEqual(config.default_age, "adult")
@@ -117,6 +121,16 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(config.prompt_token_budget_fallback, "off")
 
+    def test_normalizes_final_overflow_policy(self):
+        config = RuntimeConfig.from_environment(
+            {"TRANSCRIPTION_FINAL_OVERFLOW_POLICY": "DROP_NEWEST"}
+        )
+
+        self.assertEqual(
+            config.transcription_final_overflow_policy,
+            "drop_newest",
+        )
+
     def test_rejects_invalid_startup_controls_together(self):
         with self.assertRaises(ConfigError) as context:
             RuntimeConfig.from_environment(
@@ -185,6 +199,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     "RUNTIME_SHUTDOWN_GRACE_SECONDS": "0",
                     "OSC_OUTPUT_ERROR_LOG_INTERVAL": "0",
                     "PROMPT_TOKEN_BUDGET_FALLBACK": "approximate",
+                    "TRANSCRIPTION_FINAL_OVERFLOW_POLICY": "random",
                     "PROMPT_MAX_TOKENS": "1",
                 }
             )
@@ -224,6 +239,11 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertIn(
             "PROMPT_TOKEN_BUDGET_FALLBACK must be one of: conservative, off",
+            errors,
+        )
+        self.assertIn(
+            "TRANSCRIPTION_FINAL_OVERFLOW_POLICY must be one of: "
+            "drop_newest, drop_oldest",
             errors,
         )
         self.assertIn("PROMPT_MAX_TOKENS must be at least 2", errors)

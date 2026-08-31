@@ -55,7 +55,7 @@ class RealtimeJobSchedulerTests(unittest.TestCase):
 
     def test_retried_final_waits_until_ready(self):
         scheduler = RealtimeJobScheduler()
-        job = scheduler.submit_final(make_segment(3, 4, is_final=True), now=1.0)
+        scheduler.submit_final(make_segment(3, 4, is_final=True), now=1.0)
         job = scheduler.next_job(now=1.0)
 
         self.assertTrue(scheduler.retry_final(job, now=1.1, delay_seconds=2.0))
@@ -65,20 +65,95 @@ class RealtimeJobSchedulerTests(unittest.TestCase):
         self.assertEqual(retried.attempts, 1)
         self.assertEqual(scheduler.metrics().retries, 1)
 
-    def test_drops_stale_work_and_reports_capacity_drops(self):
+    def test_drops_oldest_final_by_default_to_admit_fresher_speech(self):
+        scheduler = RealtimeJobScheduler(max_final_jobs=1)
+        first = scheduler.submit_final(
+            make_segment(1, 1, is_final=True),
+            now=1.0,
+        )
+        second = scheduler.submit_final(
+            make_segment(2, 1, is_final=True),
+            now=1.1,
+        )
+
+        queued = scheduler.next_job(now=1.1)
+        metrics = scheduler.metrics()
+
+        self.assertTrue(first.accepted)
+        self.assertTrue(second.accepted)
+        self.assertEqual(second.drop_reason, "oldest_capacity")
+        self.assertEqual(second.dropped_job.segment.segment_id, 1)
+        self.assertEqual(queued.segment.segment_id, 2)
+        self.assertEqual(metrics.submitted_finals, 2)
+        self.assertEqual(metrics.dropped_finals, 1)
+        self.assertEqual(metrics.dropped_final_oldest, 1)
+        self.assertEqual(metrics.dropped_final_newest, 0)
+
+    def test_can_drop_newest_final_to_preserve_complete_fifo_history(self):
         scheduler = RealtimeJobScheduler(
             max_final_jobs=1,
+            final_overflow_policy="drop_newest",
+        )
+        scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
+        second = scheduler.submit_final(
+            make_segment(2, 1, is_final=True),
+            now=1.1,
+        )
+
+        queued = scheduler.next_job(now=1.1)
+        metrics = scheduler.metrics()
+
+        self.assertFalse(second.accepted)
+        self.assertEqual(second.drop_reason, "newest_capacity")
+        self.assertEqual(second.dropped_job.segment.segment_id, 2)
+        self.assertEqual(queued.segment.segment_id, 1)
+        self.assertEqual(metrics.submitted_finals, 1)
+        self.assertEqual(metrics.dropped_final_oldest, 0)
+        self.assertEqual(metrics.dropped_final_newest, 1)
+
+    def test_older_retry_never_evicts_fresher_queued_speech(self):
+        scheduler = RealtimeJobScheduler(
+            max_final_jobs=1,
+            final_overflow_policy="drop_oldest",
+        )
+        scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
+        older_job = scheduler.next_job(now=1.0)
+        scheduler.submit_final(make_segment(2, 1, is_final=True), now=1.1)
+
+        retry = scheduler.retry_final(
+            older_job,
+            now=1.2,
+            delay_seconds=0.0,
+        )
+        queued = scheduler.next_job(now=1.2)
+        metrics = scheduler.metrics()
+
+        self.assertFalse(retry.accepted)
+        self.assertEqual(retry.drop_reason, "oldest_capacity")
+        self.assertEqual(queued.segment.segment_id, 2)
+        self.assertEqual(metrics.retries, 0)
+        self.assertEqual(metrics.dropped_final_oldest, 1)
+
+    def test_drops_stale_work_separately_from_capacity_drops(self):
+        scheduler = RealtimeJobScheduler(
+            max_final_jobs=2,
             partial_max_age_seconds=1.0,
             final_max_age_seconds=1.0,
         )
         scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
-        self.assertIsNone(scheduler.submit_final(make_segment(2, 1, is_final=True), now=1.1))
         scheduler.submit_partial(make_segment(3, 1), now=1.1)
 
         self.assertIsNone(scheduler.next_job(now=2.2))
         metrics = scheduler.metrics()
-        self.assertEqual(metrics.dropped_finals, 1)
+        self.assertEqual(metrics.dropped_finals, 0)
         self.assertEqual(metrics.dropped_stale, 2)
+
+    def test_rejects_unknown_overflow_policy(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "final_overflow_policy must be one of",
+        ):
+            RealtimeJobScheduler(final_overflow_policy="discard_random")
 
 
 if __name__ == "__main__":

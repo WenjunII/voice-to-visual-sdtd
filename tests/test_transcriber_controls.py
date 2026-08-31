@@ -262,12 +262,91 @@ class RealTimePipelineControlTests(unittest.TestCase):
             ("/prompt_style", "general_scene"),
             ("/language", "zh"),
             ("/prompt_budget_mode", "disabled"),
+            ("/dropped_final_oldest", 0),
+            ("/dropped_final_newest", 0),
         }
         calls = {
             (message.address, message.value)
             for message in pipeline.recording_publisher.messages
         }
         self.assertTrue(expected.issubset(calls))
+
+
+class SchedulerOverflowLoggingTests(unittest.TestCase):
+    @staticmethod
+    def segment(segment_id):
+        return SimpleNamespace(
+            segment_id=segment_id,
+            version=1,
+            is_final=True,
+        )
+
+    def test_logs_oldest_drop_and_cleans_replaced_segment_state(self):
+        publisher = RecordingOutputPublisher()
+        pipeline = make_pipeline(
+            replace(
+                RuntimeConfig(),
+                transcription_max_final_jobs=1,
+                transcription_final_overflow_policy="drop_oldest",
+            ),
+            output_publisher=publisher,
+        )
+        pipeline.stabilizers[1] = object()
+        pipeline.submit_final_segment(
+            self.segment(1),
+            1.0,
+            source="completed",
+        )
+
+        submission = pipeline.submit_final_segment(
+            self.segment(2),
+            1.1,
+            source="completed",
+        )
+
+        self.assertTrue(submission.accepted)
+        self.assertNotIn(1, pipeline.stabilizers)
+        event = pipeline.scheduler_logger.warning.call_args.kwargs["extra"]
+        self.assertEqual(event["event"], "scheduler_final_oldest_dropped")
+        self.assertEqual(event["segment_id"], 1)
+        self.assertEqual(event["incoming_segment_id"], 2)
+        with patch("transcriber.time.monotonic", return_value=1.2):
+            pipeline.send_runtime_status(force=True)
+        status = {
+            (message.address, message.value)
+            for message in publisher.messages
+        }
+        self.assertIn(("/dropped_jobs", 1), status)
+        self.assertIn(("/dropped_final_oldest", 1), status)
+        self.assertIn(("/dropped_final_newest", 0), status)
+        pipeline.close()
+
+    def test_logs_newest_drop_when_fifo_completeness_is_selected(self):
+        pipeline = make_pipeline(
+            replace(
+                RuntimeConfig(),
+                transcription_max_final_jobs=1,
+                transcription_final_overflow_policy="drop_newest",
+            )
+        )
+        pipeline.submit_final_segment(
+            self.segment(1),
+            1.0,
+            source="completed",
+        )
+
+        submission = pipeline.submit_final_segment(
+            self.segment(2),
+            1.1,
+            source="interrupted",
+        )
+
+        self.assertFalse(submission.accepted)
+        event = pipeline.scheduler_logger.warning.call_args.kwargs["extra"]
+        self.assertEqual(event["event"], "scheduler_final_newest_dropped")
+        self.assertEqual(event["segment_id"], 2)
+        self.assertEqual(event["source"], "interrupted")
+        pipeline.close()
 
 
 class BackendAdapterIntegrationTests(unittest.TestCase):
@@ -477,6 +556,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             scene_memory_max_words=12,
             scene_memory_max_age_seconds=8.0,
             transcription_max_final_jobs=3,
+            transcription_final_overflow_policy="drop_newest",
             transcription_partial_max_age_seconds=1.5,
             transcription_final_max_age_seconds=9.0,
             vad_pre_roll_seconds=0.1,
@@ -494,6 +574,7 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
             scene_memory_max_words=48,
             scene_memory_max_age_seconds=30.0,
             transcription_max_final_jobs=11,
+            transcription_final_overflow_policy="drop_oldest",
             transcription_partial_max_age_seconds=5.0,
             transcription_final_max_age_seconds=45.0,
             vad_pre_roll_seconds=0.6,
@@ -515,6 +596,8 @@ class PipelineConfigurationIsolationTests(unittest.TestCase):
         self.assertEqual(second.audio_device_index, 7)
         self.assertEqual(first.scheduler.max_final_jobs, 3)
         self.assertEqual(second.scheduler.max_final_jobs, 11)
+        self.assertEqual(first.scheduler.final_overflow_policy, "drop_newest")
+        self.assertEqual(second.scheduler.final_overflow_policy, "drop_oldest")
         self.assertEqual(first.scheduler.partial_max_age_seconds, 1.5)
         self.assertEqual(second.scheduler.final_max_age_seconds, 45.0)
         self.assertEqual(first.scene_memory.max_words, 12)
